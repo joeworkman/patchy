@@ -7,9 +7,9 @@ A patchy little PHP dev server for macOS (running Apache).
 
 ## Why Patchy?
 
-Most modern local PHP dev environments — Laravel Valet, Herd, Lando — run Nginx + PHP-FPM under the hood. That's great for fresh frameworks but rough on anything that leans on `.htaccess`, mod_rewrite, or Apache-specific directives: [Total CMS](https://github.com/totalcms/cms), classic WordPress, Drupal, Symfony with the Apache pack, or legacy intranets that have been running on Apache for a decade.
+Apache and Nginx are both first-class web servers for PHP. Most local PHP dev environments — Valet, Herd, Lando — happen to default to Nginx + PHP-FPM. That's a great fit for some stacks; it's the wrong fit for others. If your production runs on Apache, or your app expects `.htaccess` and `mod_rewrite` to Just Work — [Total CMS](https://github.com/totalcms/cms), WordPress, Drupal, Symfony with the Apache pack, or any of the countless PHP apps that target Apache — you want a local dev environment that matches.
 
-Patchy gives you the real thing: **Apache 2 + mod_php** with local HTTPS, friendly `.test` hostnames, and one command per site.
+Patchy is that environment: **Apache 2 + mod_php**, local HTTPS, friendly `.test` hostnames, one command per site.
 
 ## What you get
 
@@ -66,7 +66,7 @@ patchy rm example.test
 | `patchy config` | Open `httpd.conf` in your editor. |
 | `patchy ini` | Open the active `php.ini` in your editor. |
 | `patchy logs` | Tail all Apache logs. |
-| `patchy errors [lines]` | Show the last *N* lines of the Apache error log (default 20). |
+| `patchy errors [lines\|-f]` | Show the last *N* lines of the Apache error log (default 20), or follow with `-f`. |
 | `patchy refresh-certs` | Regenerate all local SSL certificates. |
 | `patchy setup` | One-time setup (Apache user, dirs, vhost include). Auto-run by `brew install`. |
 | `patchy help` | Print all of the above. |
@@ -92,7 +92,7 @@ patchy rm example.test
 | GUI | — | — | ✅ |
 | License | MIT | MIT | freemium |
 
-If your stack is a modern PHP framework that targets Nginx + FPM, Valet or Herd will probably serve you better. If your stack is "the way Apache shops have built PHP for the last twenty years," Patchy is for you.
+If your stack targets Nginx + FPM, Valet or Herd will probably serve you better. If your stack targets Apache — or you just prefer Apache — Patchy is for you.
 
 ## Requirements
 

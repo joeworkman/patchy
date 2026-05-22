@@ -60,7 +60,7 @@ Commands:
 
   setup               One-time setup: configure Apache user, create dirs, enable vhost include
 
-  errors [lines]      Display the last [lines] of the Apache error log (default: 20)
+  errors [lines|-f]   Display the last [lines] of the Apache error log (default 20), or -f to follow
   logs                Tail the Apache logs
 EOF
 }
@@ -75,9 +75,23 @@ function stop_server() {
     brew services stop httpd
 }
 
+function is_apache_running() {
+    brew services info httpd --json | jq -e '.[0].running' >/dev/null 2>&1
+}
+
 function restart_server() {
     echo "Restarting Apache server..."
     brew services restart httpd
+    # brew services returns 0 even if launchd fails to bring the process up.
+    # Give it a moment and verify.
+    local i
+    for i in 1 2 3; do
+        sleep 1
+        is_apache_running && return 0
+    done
+    echo "Warning: Apache did not come back up after restart."
+    echo "Run 'patchy errors' to see what went wrong."
+    return 1
 }
 
 function config_apache() {
@@ -100,10 +114,14 @@ function tail_logs() {
 }
 
 function errors() {
-    local lines=$1
+    local arg=$1
     local log="$LOG_DIR/error_log"
     echo "Error log... $log"
-    tail -n "$lines" "$log"
+    if [ "$arg" = "-f" ]; then
+        tail -f "$log"
+    else
+        tail -n "$arg" "$log"
+    fi
 }
 
 # Ensure httpd.conf wildcard-includes the per-site config directory.
@@ -234,19 +252,38 @@ function refresh_certs() {
     remove_root_certs
     make_cert localhost
     local site
-    for site in $(list_sites); do
+    for site in $(list_domains); do
         [ "$site" = "localhost" ] && continue
         rm -f "$site.pem" "$site-key.pem"
         make_cert "$site"
     done
 }
 
-function list_sites() {
+function list_domains() {
     [ -d "$VHOSTS_DIR" ] || return 0
     local f
     for f in "$VHOSTS_DIR"/*.conf(N); do
         echo "${f:t:r}"
     done | sort
+}
+
+function list_sites() {
+    if [ ! -d "$VHOSTS_DIR" ] || [ -z "$(list_domains)" ]; then
+        echo "No sites configured."
+        return 0
+    fi
+    local domain docroot has_https
+    printf "%-32s %-50s %s\n" "DOMAIN" "DOCROOT" "HTTPS"
+    while IFS= read -r domain; do
+        docroot=$(sed -n 's/^[[:space:]]*DocumentRoot[[:space:]]*"\(.*\)".*/\1/p' "$VHOSTS_DIR/$domain.conf" | head -n1)
+        docroot="${docroot/#$HOME/~}"
+        if [ -f "$CERT_DIR/$domain.pem" ]; then
+            has_https="yes"
+        else
+            has_https="no"
+        fi
+        printf "%-32s %-50s %s\n" "$domain" "$docroot" "$has_https"
+    done < <(list_domains)
 }
 
 function site_exists() {
@@ -300,7 +337,7 @@ function backup_config() {
 }
 
 function server_status() {
-    if brew services info httpd --json | jq -e '.[0].running' >/dev/null; then
+    if is_apache_running; then
         echo "Running"
     else
         echo "Stopped"
