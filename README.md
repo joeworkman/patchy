@@ -78,7 +78,7 @@ patchy rm example.test
 To use a different editor, add this to your shell profile (e.g. `~/.zshrc` or `~/.bashrc`):
 
 ```bash
-export EDITOR=code      # or vim, nvim, subl, cursor, etc.
+export EDITOR=vim # or nvim, subl, cursor, etc.
 # or, to wait for the editor to close before returning:
 export VISUAL="code -w"
 ```
@@ -116,15 +116,21 @@ If your stack targets Nginx + FPM, Valet or Herd will probably serve you better.
 ## Uninstall
 
 ```bash
-# Remove all sites
-patchy list | xargs -n1 patchy rm
+# (Optional) remove sites first — cleans up /etc/hosts entries and certs
+patchy list                              # see what's configured
+patchy rm <domain>                       # repeat per site
 
-# Remove the binary
-sudo rm /usr/local/bin/patchy
+# Uninstall Patchy
+brew uninstall joeworkman/patchy/patchy
 
-# (Optional) remove the dependencies
-brew uninstall httpd php mkcert hostess
+# (Optional) remove Homebrew dependencies nothing else is using
+brew autoremove
+
+# (Optional) untap the formula
+brew untap joeworkman/patchy
 ```
+
+If you installed from source: `sudo rm /usr/local/bin/patchy`.
 
 ## Contributing
 
