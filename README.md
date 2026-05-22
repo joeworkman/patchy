@@ -68,7 +68,7 @@ patchy rm example.test
 | `patchy logs` | Tail all Apache logs. |
 | `patchy errors [lines]` | Show the last *N* lines of the Apache error log (default 20). |
 | `patchy refresh-certs` | Regenerate all local SSL certificates. |
-| `patchy install` | Install dependencies (run once). |
+| `patchy install` | One-time setup (Apache user, dirs, vhost include). Auto-run by `brew install`. |
 | `patchy help` | Print all of the above. |
 
 ## Where things live
