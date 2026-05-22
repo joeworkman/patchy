@@ -44,6 +44,9 @@ patchy setup
 # Add a site — docroot defaults to ~/Websites/example.test
 patchy add example.test
 
+# Add a site — provide path to site docroot
+patchy add example.test developer/example.test
+
 # Open https://example.test in your browser
 
 # When you're done
