@@ -1,0 +1,542 @@
+#!/bin/zsh
+
+# Patchy — a patchy little Apache + PHP dev server for macOS
+
+set -uo pipefail
+
+# Get the Homebrew installation prefix
+BREW_PREFIX="$(brew --prefix)"
+export BREW_PREFIX
+
+# Define the directory for Apache virtual hosts
+VHOSTS_DIR="$BREW_PREFIX/etc/httpd/sites"
+export VHOSTS_DIR
+
+# Define the Apache configuration file path
+APACHE_CONFIG="$BREW_PREFIX/etc/httpd/httpd.conf"
+export APACHE_CONFIG
+
+# Define the directory for SSL certificates
+CERT_DIR="$BREW_PREFIX/etc/httpd/certs"
+export CERT_DIR
+
+# Apache log directory
+LOG_DIR="$BREW_PREFIX/var/log/httpd"
+export LOG_DIR
+
+# Default parent directory for new site docroots
+DEFAULT_WEBROOT="$HOME/Websites"
+
+# Script name for help text (zsh's $0 resolves to function name inside functions)
+SCRIPT_NAME="${0:t}"
+
+# Function to display help message
+function show_help() {
+    cat <<EOF
+Patchy — a patchy little Apache + PHP dev server for macOS
+
+Usage: $SCRIPT_NAME {command} [options]
+
+Commands:
+  help                Show this help message
+
+  list                List the sites configured on the Apache server
+  add <domain> [dir]  Add a new site (docroot defaults to ~/Websites/<domain>)
+  rm <domain>         Remove the site with the specified domain
+
+  status              Display the status of the Apache server
+  start               Start the Apache server
+  stop                Stop the Apache server
+  restart             Restart the Apache server
+
+  config              Edit the Apache configuration file
+  ini                 Edit the PHP configuration file
+  check               Verify the Apache and PHP configuration
+
+  info                Display Apache and PHP version information
+  php <version>       Switch to the specified PHP version. You must have it installed via Homebrew.
+  pecl                Install common PECL extensions (redis, apcu, imagick, yaml, pcov, memcached)
+  refresh-certs       Refresh the SSL certificates
+
+  install             Install the necessary dependencies for the webserver
+
+  errors [lines]      Display the last [lines] of the Apache error log (default: 20)
+  logs                Tail the Apache logs
+EOF
+}
+
+function start_server() {
+    echo "Starting Apache server..."
+    brew services start httpd
+}
+
+function stop_server() {
+    echo "Stopping Apache server..."
+    brew services stop httpd
+}
+
+function restart_server() {
+    echo "Restarting Apache server..."
+    brew services restart httpd
+}
+
+function config_apache() {
+    echo "Editing configuration for Apache server..."
+    echo "$APACHE_CONFIG"
+    code "$APACHE_CONFIG"
+}
+
+function config_php() {
+    echo "Editing configuration for PHP..."
+    local ini_file
+    ini_file=$(php --ini | grep "Loaded Configuration File" | awk '{print $4}' | sed 's/"//g')
+    echo "$ini_file"
+    code "$ini_file"
+}
+
+function tail_logs() {
+    echo "Tailing logs for Apache server... $LOG_DIR"
+    tail -f "$LOG_DIR"/*
+}
+
+function errors() {
+    local lines=$1
+    local log="$LOG_DIR/error_log"
+    echo "Error log... $log"
+    tail -n "$lines" "$log"
+}
+
+# Ensure httpd.conf wildcard-includes the per-site config directory.
+# Strips any legacy per-site Include lines on first run.
+function ensure_sites_included() {
+    local include_line="IncludeOptional $VHOSTS_DIR/*.conf"
+    local has_wildcard=0
+    local has_legacy=0
+
+    grep -qF -- "$include_line" "$APACHE_CONFIG" && has_wildcard=1
+    grep -qF -- "Include $VHOSTS_DIR/" "$APACHE_CONFIG" && has_legacy=1
+
+    if [ "$has_wildcard" -eq 1 ] && [ "$has_legacy" -eq 0 ]; then
+        return 0
+    fi
+
+    backup_config
+
+    if [ "$has_legacy" -eq 1 ]; then
+        local tmp="$APACHE_CONFIG.tmp"
+        grep -vF -- "Include $VHOSTS_DIR/" "$APACHE_CONFIG" > "$tmp"
+        if [ -s "$tmp" ]; then
+            mv "$tmp" "$APACHE_CONFIG"
+        else
+            rm -f "$tmp"
+        fi
+    fi
+
+    if [ "$has_wildcard" -eq 0 ]; then
+        echo "$include_line" >> "$APACHE_CONFIG"
+        echo "Configured Apache to include sites from $VHOSTS_DIR"
+    fi
+}
+
+function add_site() {
+    local domain=$1
+    local docroot=${2:-}
+    [ -z "$docroot" ] && docroot="$DEFAULT_WEBROOT/$domain"
+
+    if site_exists "$domain"; then
+        echo "Site already exists... $domain"
+        return 1
+    fi
+
+    if [ ! -d "$docroot" ]; then
+        echo "Creating document root at $docroot"
+        mkdir -p "$docroot"
+    fi
+
+    docroot=$(cd "$docroot" && pwd)
+
+    echo "Adding a new site... $domain"
+
+    echo "Updating hosts file..."
+    sudo hostess add "$domain" 127.0.0.1
+
+    echo "Creating SSL certificates..."
+    make_cert "$domain"
+
+    mkdir -p "$VHOSTS_DIR"
+    ensure_sites_included
+
+    echo "Creating Apache config file..."
+    local conf_file="$VHOSTS_DIR/$domain.conf"
+    cat > "$conf_file" <<EOF
+<VirtualHost *:80>
+    DocumentRoot "$docroot"
+    ServerName $domain
+    ErrorLog "$LOG_DIR/$domain-error_log"
+    CustomLog "$LOG_DIR/$domain-access_log" common
+    RewriteEngine On
+    RewriteCond %{HTTPS} !=on
+    RewriteRule ^/?(.*) https://%{HTTP_HOST}/\$1 [R=301,L]
+</VirtualHost>
+
+<VirtualHost *:443>
+    DocumentRoot "$docroot"
+    ServerName $domain
+    ErrorLog "$LOG_DIR/$domain-error_log"
+    CustomLog "$LOG_DIR/$domain-access_log" common
+    SSLEngine on
+    SSLCertificateFile "$CERT_DIR/$domain.pem"
+    SSLCertificateKeyFile "$CERT_DIR/$domain-key.pem"
+</VirtualHost>
+EOF
+
+    if ! verify_config; then
+        echo "Rolling back site creation..."
+        remove_domain "$domain"
+        remove_cert "$domain"
+        return 1
+    fi
+
+    restart_server
+}
+
+function root_cert_exists() {
+    local rootdir
+    rootdir=$(mkcert -CAROOT)
+    [ -f "$rootdir/rootCA.pem" ] && [ -f "$rootdir/rootCA-key.pem" ]
+}
+
+function make_cert() {
+    local domain=$1
+    mkdir -p "$CERT_DIR"
+    cd "$CERT_DIR" || return 1
+    if ! root_cert_exists; then
+        mkcert -install
+    fi
+    mkcert "$domain"
+}
+
+function remove_root_certs() {
+    mkcert -uninstall
+    local rootdir
+    rootdir=$(mkcert -CAROOT)
+    rm -f "$rootdir/rootCA.pem" "$rootdir/rootCA-key.pem"
+}
+
+function remove_cert() {
+    local domain=$1
+    cd "$CERT_DIR" 2>/dev/null || return 0
+    rm -f "$domain.pem" "$domain-key.pem"
+}
+
+function refresh_certs() {
+    cd "$CERT_DIR" || return 1
+    remove_root_certs
+    make_cert localhost
+    local site
+    for site in $(list_sites); do
+        [ "$site" = "localhost" ] && continue
+        rm -f "$site.pem" "$site-key.pem"
+        make_cert "$site"
+    done
+}
+
+function list_sites() {
+    [ -d "$VHOSTS_DIR" ] || return 0
+    local f
+    for f in "$VHOSTS_DIR"/*.conf(N); do
+        echo "${f:t:r}"
+    done | sort
+}
+
+function site_exists() {
+    local domain=$1
+    [ -f "$VHOSTS_DIR/$domain.conf" ]
+}
+
+function remove_site() {
+    local domain=$1
+
+    if ! site_exists "$domain"; then
+        echo "Site does not exist... $domain"
+        return 1
+    fi
+
+    remove_domain "$domain"
+    remove_cert "$domain"
+    restart_server
+}
+
+function remove_domain() {
+    local domain=$1
+
+    echo "Updating hosts file..."
+    sudo hostess rm "$domain"
+
+    echo "Removing Apache config file..."
+    rm -f "$VHOSTS_DIR/$domain.conf"
+}
+
+function verify_config() {
+    if apachectl -t; then
+        echo "Apache configuration is valid."
+    else
+        echo "Apache configuration is invalid."
+        return 1
+    fi
+    if php --ini >/dev/null; then
+        echo "PHP configuration is valid."
+    else
+        echo "PHP configuration is invalid."
+        return 1
+    fi
+}
+
+function backup_config() {
+    # Remove backups older than 30 days
+    find "$BREW_PREFIX/etc/httpd" -name "httpd.conf.bkp-*" -mtime +30 -exec rm {} \;
+    # Create a fresh backup
+    cp "$APACHE_CONFIG" "$APACHE_CONFIG.bkp-$(date +%Y%m%d%H%M%S)"
+}
+
+function server_status() {
+    if brew services info httpd --json | jq -e '.[0].running' >/dev/null; then
+        echo "Running"
+    else
+        echo "Stopped"
+    fi
+}
+
+function server_info() {
+    echo -e "\033[1mApache Server Info...\033[0m"
+    apachectl -V | grep -E 'Server version|Server MPM|Server built'
+}
+
+function php_info() {
+    echo -e "\033[1mPHP Version Info...\033[0m"
+    php -v
+}
+
+function switch_php_version() {
+    if [ -z "${1:-}" ]; then
+        echo "Please provide a PHP version (e.g., 7.4, 8.1, 8.2, 8.3, 8.4)"
+        return 1
+    fi
+
+    local version=$1
+    local php_formula="php@$version"
+
+    # Detect the latest PHP version (uses 'php' formula without @version)
+    local latest_version
+    latest_version=$(brew info php --json=v2 2>/dev/null | jq -r '.formulae[0].versions.stable' | cut -d. -f1,2)
+
+    if [ "$version" = "$latest_version" ]; then
+        php_formula="php"
+    fi
+
+    if ! brew list --formula 2>/dev/null | grep -qE "^${php_formula}\$"; then
+        echo "$php_formula is not installed."
+        echo "Install it with: brew install $php_formula"
+        return 1
+    fi
+
+    echo "Switching to PHP $version..."
+    backup_config
+
+    echo "Unlinking all PHP versions..."
+    local formula
+    for formula in $(brew list --formula | grep -E '^php(@[0-9.]+)?$'); do
+        brew unlink "$formula" >/dev/null 2>&1 || true
+    done
+
+    echo "Linking PHP $version..."
+    brew link --force --overwrite "$php_formula"
+
+    echo "Updating Apache configuration..."
+
+    sed -i '' 's/^LoadModule php/#LoadModule php/' "$APACHE_CONFIG"
+
+    local major_version
+    major_version=$(echo "$version" | cut -d'.' -f1)
+    local module_path="$BREW_PREFIX/opt/$php_formula/lib/httpd/modules"
+    local module_line
+    if [ "$major_version" -ge 8 ]; then
+        module_line="LoadModule php_module $module_path/libphp.so"
+    else
+        module_line="LoadModule php7_module $module_path/libphp7.so"
+    fi
+
+    if grep -q "libphp.*\.so" "$APACHE_CONFIG"; then
+        sed -i '' "s|^#*LoadModule php[0-9]*_module.*libphp.*\.so|$module_line|" "$APACHE_CONFIG"
+    else
+        echo "$module_line" >> "$APACHE_CONFIG"
+    fi
+
+    restart_server
+
+    echo ""
+    echo "PHP version switched to:"
+    php -v | head -1
+}
+
+function install_pecl_extensions() {
+    echo "Installing PECL extensions for current PHP version..."
+    php -v | head -1
+    echo ""
+
+    echo "Installing required Homebrew dependencies..."
+    brew install libyaml imagemagick libmemcached pkg-config zlib
+
+    local pecl_ext_dir
+    pecl_ext_dir=$(php -i | grep "^extension_dir" | head -1 | awk '{print $3}')
+    echo "PECL extension directory: $pecl_ext_dir"
+
+    if [ ! -d "$pecl_ext_dir" ]; then
+        echo "Creating PECL directory: $pecl_ext_dir"
+        mkdir -p "$pecl_ext_dir"
+    fi
+
+    local extensions=("redis" "apcu" "imagick" "yaml" "pcov" "memcached")
+    local ext
+    for ext in "${extensions[@]}"; do
+        echo ""
+        echo "Installing $ext..."
+        case $ext in
+            yaml)
+                (echo "$(brew --prefix libyaml)"; yes "") | pecl install yaml || true
+                ;;
+            memcached)
+                local zlib_dir
+                zlib_dir=$(brew --prefix zlib)
+                local libmemcached_dir
+                libmemcached_dir=$(brew --prefix libmemcached)
+                printf '%s\n' "$libmemcached_dir" "$zlib_dir" "no" "no" "no" "no" "no" "yes" "yes" | pecl install memcached || true
+                ;;
+            *)
+                yes "" | pecl install "$ext" || true
+                ;;
+        esac
+    done
+
+    local ini_file
+    ini_file=$(php -n -r "echo php_ini_loaded_file();" 2>/dev/null)
+    if [ -z "$ini_file" ]; then
+        ini_file="$BREW_PREFIX/etc/php/$(php -n -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')/php.ini"
+    fi
+
+    echo ""
+    echo "Adding extensions to php.ini: $ini_file"
+
+    for ext in "${extensions[@]}"; do
+        if ! grep -qE "extension=.?${ext}(\.so)?.?$" "$ini_file"; then
+            echo "extension=\"$ext.so\"" >> "$ini_file"
+            echo "Added: extension=\"$ext.so\""
+        else
+            echo "Already configured: $ext"
+        fi
+    done
+
+    echo ""
+    echo "PECL extensions installed and configured."
+}
+
+function install_dependencies() {
+    echo "Installing dependencies..."
+
+    brew install curl httpd php mkcert hostess jq
+
+    if [ ! -e "$BREW_PREFIX/bin/code" ] && [ -d "/Applications/Visual Studio Code.app" ]; then
+        ln -s "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" "$BREW_PREFIX/bin/code"
+    fi
+
+    set_apache_user
+    mkdir -p "$VHOSTS_DIR" "$CERT_DIR"
+    ensure_sites_included
+
+    echo "Dependencies installed successfully."
+    echo "Run '$SCRIPT_NAME help' to see available commands."
+}
+
+function set_apache_user() {
+    backup_config
+    local user
+    user=$(whoami)
+    echo "Setting Apache user to $user..."
+    sudo sed -i '' "s/^User .*/User $user/" "$APACHE_CONFIG"
+    sudo sed -i '' "s/^Group .*/Group $(id -gn)/" "$APACHE_CONFIG"
+}
+
+# Main script logic to handle different commands
+case "${1:-}" in
+    help)
+        show_help
+        ;;
+    start)
+        start_server
+        ;;
+    stop)
+        stop_server
+        ;;
+    restart)
+        restart_server
+        ;;
+    check)
+        verify_config
+        ;;
+    refresh-certs)
+        refresh_certs
+        ;;
+    ini)
+        config_php
+        ;;
+    config)
+        config_apache
+        ;;
+    install)
+        install_dependencies
+        ;;
+    list)
+        echo "Sites configured on the Apache server..."
+        echo ""
+        list_sites
+        ;;
+    add)
+        if [ -z "${2:-}" ]; then
+            echo "Please provide a domain."
+            exit 1
+        fi
+        add_site "$2" "${3:-}"
+        ;;
+    rm)
+        if [ -z "${2:-}" ]; then
+            echo "Please provide a domain."
+            exit 1
+        fi
+        remove_site "$2"
+        ;;
+    errors)
+        errors "${2:-20}"
+        ;;
+    logs)
+        tail_logs
+        ;;
+    status)
+        server_status
+        ;;
+    info)
+        server_info
+        echo ""
+        php_info
+        ;;
+    php)
+        switch_php_version "${2:-}"
+        ;;
+    pecl)
+        install_pecl_extensions
+        ;;
+    *)
+        echo "Invalid command!"
+        show_help
+        exit 1
+        ;;
+esac
