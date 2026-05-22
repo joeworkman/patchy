@@ -58,7 +58,7 @@ Commands:
   pecl                Install common PECL extensions (redis, apcu, imagick, yaml, pcov, memcached)
   refresh-certs       Refresh the SSL certificates
 
-  install             Install the necessary dependencies for the webserver
+  install             One-time setup: configure Apache user, create dirs, enable vhost include
 
   errors [lines]      Display the last [lines] of the Apache error log (default: 20)
   logs                Tail the Apache logs
@@ -441,13 +441,7 @@ function install_pecl_extensions() {
 }
 
 function install_dependencies() {
-    echo "Installing dependencies..."
-
-    brew install curl httpd php mkcert hostess jq
-
-    if [ ! -e "$BREW_PREFIX/bin/code" ] && [ -d "/Applications/Visual Studio Code.app" ]; then
-        ln -s "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" "$BREW_PREFIX/bin/code"
-    fi
+    echo "Configuring Patchy..."
 
     set_apache_user
     mkdir -p "$VHOSTS_DIR" "$CERT_DIR"
@@ -462,8 +456,8 @@ function set_apache_user() {
     local user
     user=$(whoami)
     echo "Setting Apache user to $user..."
-    sudo sed -i '' "s/^User .*/User $user/" "$APACHE_CONFIG"
-    sudo sed -i '' "s/^Group .*/Group $(id -gn)/" "$APACHE_CONFIG"
+    sed -i '' "s/^User .*/User $user/" "$APACHE_CONFIG"
+    sed -i '' "s/^Group .*/Group $(id -gn)/" "$APACHE_CONFIG"
 }
 
 # Main script logic to handle different commands

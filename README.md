@@ -25,10 +25,9 @@ Patchy gives you the real thing: **Apache 2 + mod_php** with local HTTPS, friend
 
 ```bash
 brew install joeworkman/patchy/patchy
-patchy install
 ```
 
-`patchy install` configures Apache to run as your user and sets up the vhost include directive. The Homebrew dependencies (`httpd`, `php`, `mkcert`, `hostess`, `jq`) are pulled in automatically by the formula.
+That's it — the formula pulls in all dependencies (`httpd`, `php`, `mkcert`, `hostess`, `jq`) and configures Apache to run as your user during install.
 
 ### From source
 
