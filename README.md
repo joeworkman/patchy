@@ -71,6 +71,8 @@ patchy rm example.test
 | `patchy setup` | One-time setup (Apache user, dirs, vhost include). Auto-run by `brew install`. |
 | `patchy help` | Print all of the above. |
 
+`config` and `ini` open files in `$VISUAL`, then `$EDITOR`, falling back to `code` (VS Code) if neither is set.
+
 ## Where things live
 
 | | |

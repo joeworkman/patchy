@@ -94,10 +94,21 @@ function restart_server() {
     return 1
 }
 
+function open_in_editor() {
+    local file=$1
+    # Honor $VISUAL, then $EDITOR, falling back to `code` (VS Code) as the default.
+    local editor="${VISUAL:-${EDITOR:-code}}"
+    if ! command -v "${editor%% *}" >/dev/null 2>&1; then
+        echo "Editor '$editor' not found. Set \$VISUAL or \$EDITOR to your preferred editor." >&2
+        return 1
+    fi
+    $editor "$file"
+}
+
 function config_apache() {
     echo "Editing configuration for Apache server..."
     echo "$APACHE_CONFIG"
-    code "$APACHE_CONFIG"
+    open_in_editor "$APACHE_CONFIG"
 }
 
 function config_php() {
@@ -105,7 +116,7 @@ function config_php() {
     local ini_file
     ini_file=$(php --ini | grep "Loaded Configuration File" | awk '{print $4}' | sed 's/"//g')
     echo "$ini_file"
-    code "$ini_file"
+    open_in_editor "$ini_file"
 }
 
 function tail_logs() {
