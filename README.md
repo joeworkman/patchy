@@ -1,6 +1,6 @@
 # Patchy
 
-A patchy little Apache + PHP dev server for macOS.
+A patchy little PHP dev server for macOS (running Apache).
 
 > Apache was originally a pun on "a patchy server" — it was built from patches on top of NCSA HTTPd.
 > Patchy is a patchy little CLI for managing local Apache + mod_php sites on your Mac.

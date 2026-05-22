@@ -1,6 +1,6 @@
 #!/bin/zsh
 
-# Patchy — a patchy little Apache + PHP dev server for macOS
+# Patchy — a patchy little PHP dev server for macOS (running Apache)
 
 set -uo pipefail
 
@@ -33,7 +33,7 @@ SCRIPT_NAME="${0:t}"
 # Function to display help message
 function show_help() {
     cat <<EOF
-Patchy — a patchy little Apache + PHP dev server for macOS
+Patchy — a patchy little PHP dev server for macOS (running Apache)
 
 Usage: $SCRIPT_NAME {command} [options]
 
