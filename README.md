@@ -7,7 +7,7 @@ A patchy little PHP dev server for macOS (running Apache).
 
 ## Why Patchy?
 
-Apache and Nginx are both first-class web servers for PHP. Most local PHP dev environments — Valet, Herd, Lando — happen to default to Nginx + PHP-FPM. That's a great fit for some stacks; it's the wrong fit for others. If your production runs on Apache, or your app expects `.htaccess` and `mod_rewrite` to Just Work — [Total CMS](https://github.com/totalcms/cms), WordPress, Drupal, Symfony with the Apache pack, or any of the countless PHP apps that target Apache — you want a local dev environment that matches.
+Most local PHP dev environments — Valet, Herd, Lando — happen to default to Nginx. That's a great fit for some stacks; it's the wrong fit for others. If your production runs on Apache, or your app expects `.htaccess` to Just Work — [Total CMS](https://github.com/totalcms/cms), WordPress, Drupal, Symfony with the Apache pack, or any of the countless PHP apps that target Apache — you want a local dev environment that matches.
 
 Patchy is that environment: **Apache 2 + mod_php**, local HTTPS, friendly `.test` hostnames, one command per site.
 
