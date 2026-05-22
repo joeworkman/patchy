@@ -96,8 +96,8 @@ function restart_server() {
 
 function open_in_editor() {
     local file=$1
-    # Honor $VISUAL, then $EDITOR, falling back to `code` (VS Code) as the default.
-    local editor="${VISUAL:-${EDITOR:-code}}"
+    # Honor $VISUAL, then $EDITOR, falling back to `nano` (preinstalled on macOS).
+    local editor="${VISUAL:-${EDITOR:-nano}}"
     if ! command -v "${editor%% *}" >/dev/null 2>&1; then
         echo "Editor '$editor' not found. Set \$VISUAL or \$EDITOR to your preferred editor." >&2
         return 1

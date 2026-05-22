@@ -71,7 +71,17 @@ patchy rm example.test
 | `patchy setup` | One-time setup (Apache user, dirs, vhost include). Auto-run by `brew install`. |
 | `patchy help` | Print all of the above. |
 
-`config` and `ini` open files in `$VISUAL`, then `$EDITOR`, falling back to `code` (VS Code) if neither is set.
+### Editor
+
+`config` and `ini` open files in `$VISUAL`, then `$EDITOR`, falling back to `nano` (preinstalled on macOS).
+
+To use a different editor, add this to your shell profile (e.g. `~/.zshrc` or `~/.bashrc`):
+
+```bash
+export EDITOR=code      # or vim, nvim, subl, cursor, etc.
+# or, to wait for the editor to close before returning:
+export VISUAL="code -w"
+```
 
 ## Where things live
 
