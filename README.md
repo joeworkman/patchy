@@ -7,7 +7,7 @@ A patchy little PHP dev server for macOS (running Apache).
 
 ## Why Patchy?
 
-Most modern local PHP dev environments — Laravel Valet, Herd, Lando — run Nginx + PHP-FPM under the hood. That's great for fresh frameworks but rough on anything that leans on `.htaccess`, mod_rewrite, or Apache-specific directives: classic WordPress, Total CMS, Drupal, Symfony with the Apache pack, or legacy intranets that have been running on Apache for a decade.
+Most modern local PHP dev environments — Laravel Valet, Herd, Lando — run Nginx + PHP-FPM under the hood. That's great for fresh frameworks but rough on anything that leans on `.htaccess`, mod_rewrite, or Apache-specific directives: [Total CMS](https://github.com/totalcms/cms), classic WordPress, Drupal, Symfony with the Apache pack, or legacy intranets that have been running on Apache for a decade.
 
 Patchy gives you the real thing: **Apache 2 + mod_php** with local HTTPS, friendly `.test` hostnames, and one command per site.
 
@@ -35,7 +35,7 @@ That's it — the formula pulls in all dependencies (`httpd`, `php`, `mkcert`, `
 git clone https://github.com/joeworkman/patchy
 cd patchy
 sudo ln -s "$PWD/bin/patchy" /usr/local/bin/patchy
-patchy install
+patchy setup
 ```
 
 ## Quick start
@@ -68,7 +68,7 @@ patchy rm example.test
 | `patchy logs` | Tail all Apache logs. |
 | `patchy errors [lines]` | Show the last *N* lines of the Apache error log (default 20). |
 | `patchy refresh-certs` | Regenerate all local SSL certificates. |
-| `patchy install` | One-time setup (Apache user, dirs, vhost include). Auto-run by `brew install`. |
+| `patchy setup` | One-time setup (Apache user, dirs, vhost include). Auto-run by `brew install`. |
 | `patchy help` | Print all of the above. |
 
 ## Where things live

@@ -58,7 +58,7 @@ Commands:
   pecl                Install common PECL extensions (redis, apcu, imagick, yaml, pcov, memcached)
   refresh-certs       Refresh the SSL certificates
 
-  install             One-time setup: configure Apache user, create dirs, enable vhost include
+  setup               One-time setup: configure Apache user, create dirs, enable vhost include
 
   errors [lines]      Display the last [lines] of the Apache error log (default: 20)
   logs                Tail the Apache logs
@@ -440,7 +440,7 @@ function install_pecl_extensions() {
     echo "PECL extensions installed and configured."
 }
 
-function install_dependencies() {
+function run_setup() {
     echo "Configuring Patchy..."
 
     set_apache_user
@@ -486,8 +486,8 @@ case "${1:-}" in
     config)
         config_apache
         ;;
-    install)
-        install_dependencies
+    setup)
+        run_setup
         ;;
     list)
         echo "Sites configured on the Apache server..."
