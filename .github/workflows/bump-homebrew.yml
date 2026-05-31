@@ -1,0 +1,66 @@
+name: Bump Homebrew formula
+
+# When a release is published, recompute the source tarball's sha256 and push
+# the updated url + sha256 into the joeworkman/homebrew-patchy tap.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to bump to (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: rel
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: echo "tag=${EVENT_TAG:-$INPUT_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tap
+        uses: actions/checkout@v4
+        with:
+          repository: joeworkman/homebrew-patchy
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Compute tarball sha256
+        id: sha
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          url="https://github.com/joeworkman/patchy/archive/refs/tags/${TAG}.tar.gz"
+          sha=$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Update formula
+        env:
+          URL: ${{ steps.sha.outputs.url }}
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          file=Formula/patchy.rb
+          sed -i -E "s|^  url \".*\"|  url \"${URL}\"|" "$file"
+          sed -i -E "s|^  sha256 \".*\"|  sha256 \"${SHA}\"|" "$file"
+          git diff -- "$file"
+
+      - name: Commit and push
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/patchy.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date — nothing to bump."
+            exit 0
+          fi
+          git commit -m "bump to patchy ${TAG}"
+          git push
