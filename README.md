@@ -58,7 +58,7 @@ patchy rm example.test
 | Command | Description |
 |---|---|
 | `patchy add <domain> [dir]` | Add a new site. Docroot defaults to `~/Websites/<domain>`. |
-| `patchy rm <domain>` | Remove a site. |
+| `patchy rm <domain>...` | Remove one or more sites. |
 | `patchy list` | List configured sites. |
 | `patchy start` / `stop` / `restart` | Control the Apache service. |
 | `patchy status` | Show whether Apache is running. |
@@ -121,7 +121,7 @@ If your stack targets Nginx + FPM, Valet or Herd will probably serve you better.
 ```bash
 # (Optional) remove sites first — cleans up /etc/hosts entries and certs
 patchy list                              # see what's configured
-patchy rm <domain>                       # repeat per site
+patchy rm <domain> [<domain>...]         # remove one or more sites
 
 # Uninstall Patchy
 brew uninstall joeworkman/patchy/patchy

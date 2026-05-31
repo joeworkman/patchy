@@ -42,7 +42,7 @@ Commands:
 
   list                List the sites configured on the Apache server
   add <domain> [dir]  Add a new site (docroot defaults to ~/Websites/<domain>)
-  rm <domain>         Remove the site with the specified domain
+  rm <domain>...      Remove one or more sites with the specified domains
 
   status              Display the status of the Apache server
   start               Start the Apache server
@@ -312,7 +312,6 @@ function remove_site() {
 
     remove_domain "$domain"
     remove_cert "$domain"
-    restart_server
 }
 
 function remove_domain() {
@@ -551,10 +550,19 @@ case "${1:-}" in
         ;;
     rm)
         if [ -z "${2:-}" ]; then
-            echo "Please provide a domain."
+            echo "Please provide one or more domains."
             exit 1
         fi
-        remove_site "$2"
+        shift
+        removed=0
+        for domain in "$@"; do
+            if remove_site "$domain"; then
+                removed=1
+            fi
+        done
+        if [ "$removed" -eq 1 ]; then
+            restart_server
+        fi
         ;;
     errors)
         errors "${2:-20}"
