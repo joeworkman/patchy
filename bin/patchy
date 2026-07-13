@@ -20,6 +20,10 @@ export APACHE_CONFIG
 CERT_DIR="$BREW_PREFIX/etc/httpd/certs"
 export CERT_DIR
 
+# Patchy-managed Apache include (rewritten in full by setup and php switch)
+PATCHY_CONF="$BREW_PREFIX/etc/httpd/patchy.conf"
+export PATCHY_CONF
+
 # Apache log directory
 LOG_DIR="$BREW_PREFIX/var/log/httpd"
 export LOG_DIR
@@ -29,6 +33,9 @@ DEFAULT_WEBROOT="$HOME/Websites"
 
 # Script name for help text (zsh's $0 resolves to function name inside functions)
 SCRIPT_NAME="${0:t}"
+
+# Path of the most recent httpd.conf backup (set by backup_config)
+LAST_BACKUP=""
 
 # Function to display help message
 function show_help() {
@@ -58,7 +65,7 @@ Commands:
   pecl                Install common PECL extensions (redis, apcu, imagick, yaml, pcov, memcached)
   refresh-certs       Refresh the SSL certificates
 
-  setup               One-time setup: configure Apache user, create dirs, enable vhost include
+  setup               One-time setup: Apache user, ports 80/443, modules, PHP handler, vhost include
 
   errors [lines|-f]   Display the last [lines] of the Apache error log (default 20), or -f to follow
   logs                Tail the Apache logs
@@ -135,6 +142,12 @@ function errors() {
     fi
 }
 
+# Line number of the first ACTIVE (uncommented) line containing the needle
+function active_line_no() {
+    local needle=$1 file=$2
+    grep -nF -- "$needle" "$file" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' | head -n1 | cut -d: -f1
+}
+
 # Ensure httpd.conf wildcard-includes the per-site config directory.
 # Strips any legacy per-site Include lines on first run.
 function ensure_sites_included() {
@@ -142,7 +155,7 @@ function ensure_sites_included() {
     local has_wildcard=0
     local has_legacy=0
 
-    grep -qF -- "$include_line" "$APACHE_CONFIG" && has_wildcard=1
+    [ -n "$(active_line_no "$include_line" "$APACHE_CONFIG")" ] && has_wildcard=1
     grep -qF -- "Include $VHOSTS_DIR/" "$APACHE_CONFIG" && has_legacy=1
 
     if [ "$has_wildcard" -eq 1 ] && [ "$has_legacy" -eq 0 ]; then
@@ -164,6 +177,60 @@ function ensure_sites_included() {
     if [ "$has_wildcard" -eq 0 ]; then
         echo "$include_line" >> "$APACHE_CONFIG"
         echo "Configured Apache to include sites from $VHOSTS_DIR"
+    fi
+}
+
+# patchy.conf owns Listen — comment out httpd.conf's own Listen lines
+# (duplicate Listen directives for the same port are a fatal startup error)
+function disable_main_conf_listen() {
+    if grep -q '^Listen ' "$APACHE_CONFIG"; then
+        sed -i '' 's/^Listen /#Listen /' "$APACHE_CONFIG"
+        echo "Commented out Listen lines in httpd.conf (now set in patchy.conf)"
+    fi
+}
+
+# patchy.conf owns mod_php — comment out httpd.conf's LoadModule php lines,
+# including duplicates accumulated by older 'patchy php' runs
+function disable_main_conf_php() {
+    if grep -q '^LoadModule php' "$APACHE_CONFIG"; then
+        sed -i '' 's/^LoadModule php/#LoadModule php/' "$APACHE_CONFIG"
+        echo "Commented out LoadModule php lines in httpd.conf (now set in patchy.conf)"
+    fi
+}
+
+# Ensure httpd.conf includes patchy.conf BEFORE the per-site vhosts: Apache
+# parses sequentially, and vhost directives like RewriteEngine error at parse
+# time if their module loads later.
+function ensure_patchy_included() {
+    local include_line="Include $PATCHY_CONF"
+    local sites_line="IncludeOptional $VHOSTS_DIR/*.conf"
+    local inc_no sites_no
+    inc_no=$(active_line_no "$include_line" "$APACHE_CONFIG")
+    sites_no=$(active_line_no "$sites_line" "$APACHE_CONFIG")
+
+    if [ -n "$inc_no" ] && { [ -z "$sites_no" ] || [ "$inc_no" -lt "$sites_no" ]; }; then
+        return 0
+    fi
+
+    local tmp="$APACHE_CONFIG.tmp"
+    if [ -n "$sites_no" ]; then
+        grep -vF -- "$include_line" "$APACHE_CONFIG" | \
+            awk -v inc="$include_line" -v sites="$sites_line" '
+                { line = $0; sub(/^[[:space:]]+/, "", line) }
+                index(line, sites) == 1 && !done { print inc; done = 1 }
+                { print }
+            ' > "$tmp"
+    else
+        grep -vF -- "$include_line" "$APACHE_CONFIG" > "$tmp"
+        echo "$include_line" >> "$tmp"
+    fi
+    if [ -s "$tmp" ] && grep -qF -- "$include_line" "$tmp"; then
+        mv "$tmp" "$APACHE_CONFIG"
+        echo "Configured httpd.conf to include $PATCHY_CONF"
+    else
+        rm -f "$tmp"
+        echo "Error: failed to update $APACHE_CONFIG; no changes made." >&2
+        return 1
     fi
 }
 
@@ -198,6 +265,12 @@ function add_site() {
     echo "Creating Apache config file..."
     local conf_file="$VHOSTS_DIR/$domain.conf"
     cat > "$conf_file" <<EOF
+<Directory "$docroot">
+    Options Indexes FollowSymLinks
+    AllowOverride All
+    Require all granted
+</Directory>
+
 <VirtualHost *:80>
     DocumentRoot "$docroot"
     ServerName $domain
@@ -342,8 +415,9 @@ function verify_config() {
 function backup_config() {
     # Remove backups older than 30 days
     find "$BREW_PREFIX/etc/httpd" -name "httpd.conf.bkp-*" -mtime +30 -exec rm {} \;
-    # Create a fresh backup
-    cp "$APACHE_CONFIG" "$APACHE_CONFIG.bkp-$(date +%Y%m%d%H%M%S)"
+    # Create a fresh backup, remembering the path for restore-on-failure
+    LAST_BACKUP="$APACHE_CONFIG.bkp-$(date +%Y%m%d%H%M%S)"
+    cp "$APACHE_CONFIG" "$LAST_BACKUP"
 }
 
 function server_status() {
@@ -364,6 +438,31 @@ function php_info() {
     php -v
 }
 
+# Resolve the Homebrew formula for a PHP version: "php" for the latest, "php@X.Y" otherwise
+function php_formula_for_version() {
+    local version=$1
+    local php_formula="php@$version"
+    local latest_version
+    latest_version=$(brew info php --json=v2 2>/dev/null | jq -r '.formulae[0].versions.stable' | cut -d. -f1,2)
+    if [ "$version" = "$latest_version" ]; then
+        php_formula="php"
+    fi
+    echo "$php_formula"
+}
+
+# Build the Apache LoadModule line for a PHP version/formula
+function php_module_line() {
+    local version=$1
+    local php_formula=$2
+    local major_version="${version%%.*}"
+    local module_path="$BREW_PREFIX/opt/$php_formula/lib/httpd/modules"
+    if [ "$major_version" -ge 8 ]; then
+        echo "LoadModule php_module $module_path/libphp.so"
+    else
+        echo "LoadModule php7_module $module_path/libphp7.so"
+    fi
+}
+
 function switch_php_version() {
     if [ -z "${1:-}" ]; then
         echo "Please provide a PHP version (e.g., 7.4, 8.1, 8.2, 8.3, 8.4)"
@@ -371,17 +470,10 @@ function switch_php_version() {
     fi
 
     local version=$1
-    local php_formula="php@$version"
+    local php_formula
+    php_formula=$(php_formula_for_version "$version")
 
-    # Detect the latest PHP version (uses 'php' formula without @version)
-    local latest_version
-    latest_version=$(brew info php --json=v2 2>/dev/null | jq -r '.formulae[0].versions.stable' | cut -d. -f1,2)
-
-    if [ "$version" = "$latest_version" ]; then
-        php_formula="php"
-    fi
-
-    if ! brew list --formula 2>/dev/null | grep -qE "^${php_formula}\$"; then
+    if ! brew list --formula 2>/dev/null | grep -E "^${php_formula}\$" >/dev/null; then
         echo "$php_formula is not installed."
         echo "Install it with: brew install $php_formula"
         return 1
@@ -401,23 +493,17 @@ function switch_php_version() {
 
     echo "Updating Apache configuration..."
 
-    sed -i '' 's/^LoadModule php/#LoadModule php/' "$APACHE_CONFIG"
-
-    local major_version
-    major_version=$(echo "$version" | cut -d'.' -f1)
-    local module_path="$BREW_PREFIX/opt/$php_formula/lib/httpd/modules"
     local module_line
-    if [ "$major_version" -ge 8 ]; then
-        module_line="LoadModule php_module $module_path/libphp.so"
-    else
-        module_line="LoadModule php7_module $module_path/libphp7.so"
+    module_line=$(php_module_line "$version" "$php_formula")
+    if [ ! -f "${module_line##* }" ]; then
+        echo "Warning: PHP module not found at ${module_line##* }"
     fi
-
-    if grep -q "libphp.*\.so" "$APACHE_CONFIG"; then
-        sed -i '' "s|^#*LoadModule php[0-9]*_module.*libphp.*\.so|$module_line|" "$APACHE_CONFIG"
-    else
-        echo "$module_line" >> "$APACHE_CONFIG"
-    fi
+    write_patchy_conf "$module_line"
+    # Belt-and-suspenders for installs upgraded without re-running setup
+    disable_main_conf_listen
+    disable_main_conf_php
+    ensure_sites_included
+    ensure_patchy_included
 
     restart_server
 
@@ -487,19 +573,112 @@ function install_pecl_extensions() {
     echo "PECL extensions installed and configured."
 }
 
+# Rewrite the patchy-managed Apache include in full.
+# <IfModule !…> guards avoid double-loading modules the user's httpd.conf
+# already enables. Listen lives here exclusively: duplicate Listen directives
+# are a fatal startup error, so httpd.conf's own Listen lines get commented
+# out (see disable_main_conf_listen).
+function write_patchy_conf() {
+    local php_line=$1
+    local php_guard="php_module"
+    case "$php_line" in
+        *php7_module*) php_guard="php7_module" ;;
+    esac
+    cat > "$PATCHY_CONF" <<EOF
+# Managed by Patchy — do not edit.
+# Rewritten in full by 'patchy setup' and 'patchy php <version>'.
+
+Listen 80
+Listen 443
+
+<IfModule !socache_shmcb_module>
+LoadModule socache_shmcb_module lib/httpd/modules/mod_socache_shmcb.so
+</IfModule>
+<IfModule !ssl_module>
+LoadModule ssl_module lib/httpd/modules/mod_ssl.so
+</IfModule>
+<IfModule !rewrite_module>
+LoadModule rewrite_module lib/httpd/modules/mod_rewrite.so
+</IfModule>
+
+$php_line
+
+<IfModule dir_module>
+    DirectoryIndex index.php index.html
+</IfModule>
+
+<IfModule $php_guard>
+    <FilesMatch \.php\$>
+        SetHandler application/x-httpd-php
+    </FilesMatch>
+</IfModule>
+EOF
+    echo "Wrote $PATCHY_CONF"
+}
+
+# PHP LoadModule line for setup: keep whatever patchy.conf already has
+# (setup must not undo a 'patchy php' switch); otherwise preserve whatever
+# mod_php the existing httpd.conf still actively loads (a migration case);
+# otherwise derive it from the currently linked PHP; otherwise fall back to
+# the default 'php' formula. Both preservation branches skip a stale line
+# whose module file no longer exists (e.g. the formula was uninstalled),
+# so the next precedence step can self-heal it.
+function detect_php_line() {
+    local line
+    line=$(grep -m1 '^LoadModule php' "$PATCHY_CONF" 2>/dev/null)
+    if [ -n "$line" ] && [ -f "${line##* }" ]; then
+        echo "$line"
+        return 0
+    fi
+    # Migration case: preserve whatever mod_php the existing httpd.conf still
+    # actively loads (detect runs before disable_main_conf_php comments it out)
+    line=$(grep -m1 '^LoadModule php' "$APACHE_CONFIG" 2>/dev/null)
+    if [ -n "$line" ] && [ -f "${line##* }" ]; then
+        echo "$line"
+        return 0
+    fi
+    local version
+    version=$(php -n -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null)
+    if [ -n "$version" ]; then
+        php_module_line "$version" "$(php_formula_for_version "$version")"
+    else
+        echo "LoadModule php_module $BREW_PREFIX/opt/php/lib/httpd/modules/libphp.so"
+    fi
+}
+
 function run_setup() {
     echo "Configuring Patchy..."
+    backup_config
+    local backup="$LAST_BACKUP"
 
     set_apache_user
-    mkdir -p "$VHOSTS_DIR" "$CERT_DIR"
-    ensure_sites_included
+    mkdir -p "$VHOSTS_DIR" "$CERT_DIR" "$LOG_DIR"
 
-    echo "Dependencies installed successfully."
+    local php_line
+    php_line=$(detect_php_line)
+    local module_file="${php_line##* }"
+    if [ ! -f "$module_file" ]; then
+        echo "Warning: PHP module not found at $module_file"
+    fi
+    write_patchy_conf "$php_line"
+
+    disable_main_conf_listen
+    disable_main_conf_php
+    ensure_sites_included
+    ensure_patchy_included
+
+    if ! apachectl -t; then
+        echo "Apache config check failed — restoring httpd.conf from $backup"
+        cp "$backup" "$APACHE_CONFIG"
+        return 1
+    fi
+
+    echo "Patchy configured successfully. Backup of httpd.conf: $backup"
+    echo "Run '$SCRIPT_NAME restart' to apply any changes."
     echo "Run '$SCRIPT_NAME help' to see available commands."
 }
 
 function set_apache_user() {
-    backup_config
     local user
     user=$(whoami)
     echo "Setting Apache user to $user..."

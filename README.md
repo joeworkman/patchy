@@ -27,7 +27,7 @@ Patchy is that environment: **Apache 2 + mod_php**, local HTTPS, friendly `.test
 brew install joeworkman/patchy/patchy
 ```
 
-That's it — the formula pulls in all dependencies (`httpd`, `php`, `mkcert`, `hostess`, `jq`) and configures Apache to run as your user during install.
+That's it — the formula pulls in all dependencies (`httpd`, `php`, `mkcert`, `hostess`, `jq`) and configures Apache (ports 80/443, required modules, PHP handler) to run as your user during install.
 
 ### From source
 
@@ -71,7 +71,7 @@ patchy rm example.test
 | `patchy logs` | Tail all Apache logs. |
 | `patchy errors [lines\|-f]` | Show the last *N* lines of the Apache error log (default 20), or follow with `-f`. |
 | `patchy refresh-certs` | Regenerate all local SSL certificates. |
-| `patchy setup` | One-time setup (Apache user, dirs, vhost include). Auto-run by `brew install`. |
+| `patchy setup` | One-time setup: Apache user, ports 80/443, required modules, PHP handler, vhost include. Idempotent; auto-run by `brew install`. |
 | `patchy help` | Print all of the above. |
 
 ### Editor
@@ -95,6 +95,7 @@ export VISUAL="code -w"
 | SSL certificates | `$(brew --prefix)/etc/httpd/certs/` |
 | Per-site logs | `$(brew --prefix)/var/log/httpd/<domain>-{access,error}_log` |
 | Main Apache config | `$(brew --prefix)/etc/httpd/httpd.conf` |
+| Patchy-managed Apache config | `$(brew --prefix)/etc/httpd/patchy.conf` |
 
 ## How it compares
 
@@ -115,6 +116,8 @@ If your stack targets Nginx + FPM, Valet or Herd will probably serve you better.
 - [Homebrew](https://brew.sh)
 - `sudo` access — only used to update `/etc/hosts` via `hostess`
 - `zsh` (the default shell on modern macOS)
+
+> **Note:** Apache binds ports 80/443 with a wildcard bind, which needs no root on modern macOS but is reachable from your local network (handy for testing from a phone). The macOS firewall may ask once to allow `httpd`.
 
 ## Uninstall
 
