@@ -31,6 +31,14 @@ export LOG_DIR
 # Default parent directory for new site docroots
 DEFAULT_WEBROOT="$HOME/Websites"
 
+# dnsmasq answers wildcard *.tld lookups on an unprivileged port; macOS
+# routes each TLD to it via /etc/resolver/<tld> (written once, with sudo)
+DNSMASQ_PORT=53535
+DNSMASQ_CONF="$BREW_PREFIX/etc/dnsmasq.conf"
+DNSMASQ_DIR="$BREW_PREFIX/etc/dnsmasq.d"
+PATCHY_DNS_CONF="$DNSMASQ_DIR/patchy.conf"
+RESOLVER_DIR="/etc/resolver"
+
 # Script name for help text (zsh's $0 resolves to function name inside functions)
 SCRIPT_NAME="${0:t}"
 
@@ -51,9 +59,9 @@ Commands:
   add <domain> [dir]  Add a new site (docroot defaults to ~/Websites/<domain>)
   rm <domain>...      Remove one or more sites with the specified domains
 
-  status              Display the status of the Apache server
-  start               Start the Apache server
-  stop                Stop the Apache server
+  status              Display the status of the Apache and DNS servers
+  start               Start the Apache and DNS servers
+  stop                Stop the Apache and DNS servers
   restart             Restart the Apache server
 
   config              Edit the Apache configuration file
@@ -65,7 +73,7 @@ Commands:
   pecl                Install common PECL extensions (redis, apcu, imagick, yaml, pcov, memcached)
   refresh-certs       Refresh the SSL certificates
 
-  setup               One-time setup: Apache user, ports 80/443, modules, PHP handler, vhost include
+  setup               One-time setup: Apache user, ports 80/443, modules, PHP handler, vhost include, DNS
 
   errors [lines|-f]   Display the last [lines] of the Apache error log (default 20), or -f to follow
   logs                Tail the Apache logs
@@ -75,11 +83,21 @@ EOF
 function start_server() {
     echo "Starting Apache server..."
     brew services start httpd
+    start_dns
+    if [ -n "$(list_local_domains)" ]; then
+        local_sites_warning
+        hosts_restore_all || echo "Warning: some .local hosts entries were not restored. Re-run '$SCRIPT_NAME start'." >&2
+    fi
 }
 
 function stop_server() {
     echo "Stopping Apache server..."
     brew services stop httpd
+    stop_dns
+    if [ -n "$(list_local_domains)" ]; then
+        local_sites_warning
+        hosts_remove_all || echo "Warning: .local hosts entries were not removed; those names still resolve." >&2
+    fi
 }
 
 function is_apache_running() {
@@ -98,6 +116,280 @@ function restart_server() {
     done
     echo "Warning: Apache did not come back up after restart."
     echo "Run 'patchy errors' to see what went wrong."
+    return 1
+}
+
+function dns_configured() {
+    [ -f "$PATCHY_DNS_CONF" ]
+}
+
+function is_dnsmasq_running() {
+    brew services info dnsmasq --json 2>/dev/null | jq -e '.[0].running' >/dev/null 2>&1
+}
+
+function start_dns() {
+    if ! dns_configured; then
+        echo "DNS is not configured — run '$SCRIPT_NAME setup'."
+        return 0
+    fi
+    echo "Starting DNS server..."
+    brew services start dnsmasq
+}
+
+function stop_dns() {
+    if ! dns_configured; then
+        echo "DNS is not configured — run '$SCRIPT_NAME setup'."
+        return 0
+    fi
+    echo "Stopping DNS server..."
+    brew services stop dnsmasq
+}
+
+function restart_dns() {
+    echo "Restarting DNS server..."
+    brew services restart dnsmasq
+}
+
+# TLDs patchy serves: .test always, every TLD with a configured site, and any
+# TLD already in the dnsmasq config (removing a site never tears down its TLD)
+function list_tlds() {
+    local domain
+    {
+        echo "test"
+        for domain in $(list_domains); do
+            echo "${domain##*.}"
+        done
+        sed -n 's|^address=/\.\(.*\)/127\.0\.0\.1$|\1|p' "$PATCHY_DNS_CONF" 2>/dev/null
+    } | sort -u | grep -v '^local$'
+    return 0
+}
+
+# Rewrite the patchy-managed dnsmasq config in full. Port 53535 is
+# unprivileged, so dnsmasq runs as the user — no sudo, no system daemon.
+function write_dns_conf() {
+    mkdir -p "$DNSMASQ_DIR"
+    local tlds tld
+    tlds=$(list_tlds)
+    {
+        echo "# Managed by Patchy — do not edit."
+        echo ""
+        echo "port=$DNSMASQ_PORT"
+        echo "listen-address=127.0.0.1"
+        echo "bind-interfaces"
+        echo "no-resolv"
+        for tld in ${(f)tlds}; do
+            echo "address=/.$tld/127.0.0.1"
+        done
+    } > "$PATCHY_DNS_CONF"
+    echo "Wrote $PATCHY_DNS_CONF"
+}
+
+# Homebrew's dnsmasq.conf ships with conf-dir commented out; enable it so
+# dnsmasq picks up $PATCHY_DNS_CONF
+function ensure_dnsmasq_confdir() {
+    local line="conf-dir=$DNSMASQ_DIR/,*.conf"
+    if [ -n "$(active_line_no "conf-dir=$DNSMASQ_DIR" "$DNSMASQ_CONF")" ]; then
+        return 0
+    fi
+    echo "$line" >> "$DNSMASQ_CONF"
+    echo "Enabled conf-dir in $DNSMASQ_CONF"
+}
+
+function write_resolver_file() {
+    local tld=$1
+    echo "Configuring macOS to resolve .$tld domains (requires sudo)..."
+    sudo mkdir -p "$RESOLVER_DIR" || return 1
+    printf 'nameserver 127.0.0.1\nport %s\n' "$DNSMASQ_PORT" | sudo tee "$RESOLVER_DIR/$tld" >/dev/null || return 1
+}
+
+# A resolver file only counts if it routes to our port — a stale file from
+# another tool (e.g. Valet) would silently send lookups to the wrong port
+function resolver_file_ok() {
+    local tld=$1
+    grep -qE "^port[[:space:]]+$DNSMASQ_PORT\$" "$RESOLVER_DIR/$tld" 2>/dev/null
+}
+
+# .local sites live in /etc/hosts as exact names (Bonjour-safe): macOS
+# reserves .local for mDNS, so a dnsmasq resolver file would hijack the
+# whole TLD from device discovery. Entries carry a trailing "# patchy"
+# marker so patchy can add/remove them without touching anything else.
+function is_local_domain() {
+    [ "${1##*.}" = "local" ]
+}
+
+function list_local_domains() {
+    local domain
+    for domain in $(list_domains); do
+        is_local_domain "$domain" && echo "$domain"
+    done
+    return 0
+}
+
+function local_sites_warning() {
+    echo "Password prompt ahead: these .local sites are managed via /etc/hosts,"
+    echo "which needs sudo: $(list_local_domains | tr '\n' ' ')"
+    echo "Moving them to .test (or another TLD) removes this prompt."
+}
+
+function hosts_entry_exists() {
+    local escaped="${1//./\\.}"
+    grep -qE "^127\.0\.0\.1[[:space:]]+${escaped}[[:space:]]*# patchy\$" /etc/hosts
+}
+
+function hosts_add_entry() {
+    local domain=$1
+    hosts_entry_exists "$domain" && return 0
+    echo "127.0.0.1 $domain # patchy" | sudo tee -a /etc/hosts >/dev/null
+}
+
+function hosts_remove_entry() {
+    local escaped="${1//./\\.}"
+    hosts_entry_exists "$1" || return 0
+    sudo sed -i '' -E "/^127\.0\.0\.1[[:space:]]+${escaped}[[:space:]]*# patchy\$/d" /etc/hosts
+}
+
+# stop: drop every patchy-marked entry in one edit
+function hosts_remove_all() {
+    grep -qF "# patchy" /etc/hosts || return 0
+    sudo sed -i '' '/# patchy$/d' /etc/hosts
+}
+
+# start: regenerate marked entries for all configured .local sites
+function hosts_restore_all() {
+    local domain
+    for domain in $(list_local_domains); do
+        hosts_add_entry "$domain" || return 1
+    done
+}
+
+function tld_configured() {
+    local tld=$1
+    resolver_file_ok "$tld" && grep -qF "address=/.$tld/" "$PATCHY_DNS_CONF" 2>/dev/null
+}
+
+# Make sure a domain's TLD is served before creating the site. A resolver
+# file captures the ENTIRE TLD, so new TLDs need explicit confirmation, and
+# .local is off-limits (macOS reserves it for Bonjour/mDNS).
+function ensure_tld() {
+    local domain=$1
+    local tld="${domain##*.}"
+
+    if ! dns_configured; then
+        echo "DNS is not configured — run '$SCRIPT_NAME setup' first."
+        return 1
+    fi
+
+    tld_configured "$tld" && return 0
+
+    if [ "$tld" != "test" ]; then
+        echo "The .$tld TLD is not set up yet."
+        echo ""
+        echo "Patchy resolves domains per-TLD: setting up .$tld routes EVERY"
+        echo ".$tld lookup on this Mac to 127.0.0.1 while Patchy is running."
+        echo "If .$tld is a real public TLD (like .dev or .app), real websites"
+        echo "under it will become unreachable. Made-up TLDs like .test are safe."
+        echo ""
+        printf "Set up .%s anyway? [y/N] " "$tld"
+        local reply
+        read -r reply
+        case "$reply" in
+            y|Y|yes|YES) ;;
+            *) echo "Aborted."; return 1 ;;
+        esac
+    fi
+
+    echo "Setting up DNS for .$tld domains..."
+    echo "address=/.$tld/127.0.0.1" >> "$PATCHY_DNS_CONF"
+    if ! write_resolver_file "$tld"; then
+        sed -i '' "\|^address=/\.$tld/127\.0\.0\.1\$|d" "$PATCHY_DNS_CONF"
+        echo "DNS setup for .$tld was not completed." >&2
+        return 1
+    fi
+    restart_dns
+}
+
+# Migrate hostess-era /etc/hosts entries. hostess consolidates every name
+# onto one "127.0.0.1 localhost a b c…" line, so domains are matched as
+# whitespace-delimited tokens and removed token-wise — never line-wise.
+# .local sites are re-added as patchy-marked per-line entries (kept working;
+# macOS reserves .local for Bonjour so dnsmasq can't serve them).
+function migrate_hosts_entries() {
+    local domain escaped stale=() locals=()
+    local unmarked
+    unmarked=$(grep -E '^[[:space:]]*127\.0\.0\.1[[:space:]]' /etc/hosts | grep -v '# patchy$')
+    for domain in $(list_domains); do
+        [ "$domain" = "localhost" ] && continue
+        escaped="${domain//./\\.}"
+        if echo "$unmarked" | grep -qE "[[:space:]]$escaped([[:space:]]|\$)"; then
+            if is_local_domain "$domain"; then
+                locals+=("$domain")
+            else
+                stale+=("$domain")
+            fi
+        fi
+    done
+    [ $(( ${#stale[@]} + ${#locals[@]} )) -eq 0 ] && return 0
+
+    echo "Migrating /etc/hosts entries (requires sudo)..."
+    echo "Backup: /etc/hosts.patchy-bkp"
+    sudo cp /etc/hosts /etc/hosts.patchy-bkp || return 1
+
+    local args=()
+    for domain in "${stale[@]}" "${locals[@]}"; do
+        escaped="${domain//./\\.}"
+        args+=(-e "/^[[:space:]]*127\.0\.0\.1[[:space:]]/{" \
+               -e "/# patchy\$/!s/[[:space:]]+($escaped)([[:space:]]|\$)/\\2/g" \
+               -e "}")
+    done
+    sudo sed -i '' -E "${args[@]}" /etc/hosts || return 1
+
+    local d
+    for d in "${locals[@]}"; do
+        hosts_add_entry "$d" || return 1
+    done
+}
+
+function setup_dns() {
+    if [ ! -t 0 ]; then
+        echo "Skipping DNS configuration (no interactive terminal for sudo)."
+        echo "Run '$SCRIPT_NAME setup' in a terminal to finish DNS setup."
+        return 0
+    fi
+
+    if [ ! -d "$BREW_PREFIX/opt/dnsmasq" ]; then
+        echo "dnsmasq is not installed. Install it with: brew install dnsmasq" >&2
+        return 1
+    fi
+
+    echo "Configuring DNS (dnsmasq)..."
+    ensure_dnsmasq_confdir
+    write_dns_conf
+
+    local tld
+    for tld in $(list_tlds); do
+        if ! resolver_file_ok "$tld"; then
+            write_resolver_file "$tld" || return 1
+        fi
+    done
+
+    # Pre-amendment versions wrote /etc/resolver/local, hijacking Bonjour.
+    # Only remove it if it's ours (routes to our port).
+    if resolver_file_ok "local"; then
+        echo "Removing /etc/resolver/local (macOS reserves .local for Bonjour)..."
+        sudo rm -f "$RESOLVER_DIR/local" || return 1
+    fi
+
+    migrate_hosts_entries || return 1
+
+    echo "Starting DNS server..."
+    brew services restart dnsmasq
+
+    local i
+    for i in 1 2 3; do
+        sleep 1
+        is_dnsmasq_running && return 0
+    done
+    echo "Warning: dnsmasq did not come up. Check: brew services info dnsmasq" >&2
     return 1
 }
 
@@ -253,8 +545,14 @@ function add_site() {
 
     echo "Adding a new site... $domain"
 
-    echo "Updating hosts file..."
-    sudo hostess add "$domain" 127.0.0.1
+    if is_local_domain "$domain"; then
+        echo "Heads up: .local sites are managed via /etc/hosts because macOS"
+        echo "reserves .local for Bonjour. This needs sudo now and on every"
+        echo "'patchy start/stop'. Use .test instead to avoid password prompts."
+        hosts_add_entry "$domain" || return 1
+    else
+        ensure_tld "$domain" || return 1
+    fi
 
     echo "Creating SSL certificates..."
     make_cert "$domain"
@@ -300,6 +598,7 @@ EOF
     fi
 
     restart_server
+    start_dns
 }
 
 function root_cert_exists() {
@@ -390,8 +689,10 @@ function remove_site() {
 function remove_domain() {
     local domain=$1
 
-    echo "Updating hosts file..."
-    sudo hostess rm "$domain"
+    if is_local_domain "$domain"; then
+        echo "Removing /etc/hosts entry (requires sudo)..."
+        hosts_remove_entry "$domain"
+    fi
 
     echo "Removing Apache config file..."
     rm -f "$VHOSTS_DIR/$domain.conf"
@@ -422,9 +723,16 @@ function backup_config() {
 
 function server_status() {
     if is_apache_running; then
-        echo "Running"
+        echo "Apache: Running"
     else
-        echo "Stopped"
+        echo "Apache: Stopped"
+    fi
+    if ! dns_configured; then
+        echo "DNS:    Not configured (run '$SCRIPT_NAME setup')"
+    elif is_dnsmasq_running; then
+        echo "DNS:    Running"
+    else
+        echo "DNS:    Stopped"
     fi
 }
 
@@ -647,6 +955,11 @@ function detect_php_line() {
 }
 
 function run_setup() {
+    if [ ! -d "$BREW_PREFIX/opt/dnsmasq" ]; then
+        echo "dnsmasq is not installed. Install it with: brew install dnsmasq" >&2
+        return 1
+    fi
+
     echo "Configuring Patchy..."
     backup_config
     local backup="$LAST_BACKUP"
@@ -672,6 +985,8 @@ function run_setup() {
         cp "$backup" "$APACHE_CONFIG"
         return 1
     fi
+
+    setup_dns || return 1
 
     echo "Patchy configured successfully. Backup of httpd.conf: $backup"
     echo "Run '$SCRIPT_NAME restart' to apply any changes."

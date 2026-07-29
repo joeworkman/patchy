@@ -15,7 +15,7 @@ Patchy is that environment: **Apache 2 + mod_php**, local HTTPS, friendly `.test
 
 - Per-site Apache vhost generated in a single command
 - Local HTTPS via [mkcert](https://github.com/FiloSottile/mkcert) — no browser warnings
-- Friendly hostnames via [hostess](https://github.com/cbednarski/hostess) — `/etc/hosts` managed for you
+- Friendly hostnames via a local [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) resolver — `*.test` resolves only while Patchy runs
 - Per-site error and access logs
 - Painless PHP version switching across installed Homebrew PHPs
 - One-shot PECL extension setup (`redis`, `apcu`, `imagick`, `yaml`, `pcov`, `memcached`)
@@ -27,7 +27,7 @@ Patchy is that environment: **Apache 2 + mod_php**, local HTTPS, friendly `.test
 brew install joeworkman/patchy/patchy
 ```
 
-That's it — the formula pulls in all dependencies (`httpd`, `php`, `mkcert`, `hostess`, `jq`) and configures Apache (ports 80/443, required modules, PHP handler) to run as your user during install.
+That's it — the formula pulls in all dependencies (`httpd`, `php`, `mkcert`, `dnsmasq`, `jq`) and configures Apache (ports 80/443, required modules, PHP handler) to run as your user during install.
 
 ### From source
 
@@ -60,8 +60,9 @@ patchy rm example.test
 | `patchy add <domain> [dir]` | Add a new site. Docroot defaults to `~/Websites/<domain>`. |
 | `patchy rm <domain>...` | Remove one or more sites. |
 | `patchy list` | List configured sites. |
-| `patchy start` / `stop` / `restart` | Control the Apache service. |
-| `patchy status` | Show whether Apache is running. |
+| `patchy start` / `stop` | Start/stop Apache and the DNS resolver together. |
+| `patchy restart` | Restart Apache (DNS keeps running). |
+| `patchy status` | Show whether Apache and DNS are running. |
 | `patchy check` | Verify Apache and PHP config. |
 | `patchy info` | Show Apache and PHP version info. |
 | `patchy php <version>` | Switch the active PHP version (e.g. `patchy php 8.4`). |
@@ -71,7 +72,7 @@ patchy rm example.test
 | `patchy logs` | Tail all Apache logs. |
 | `patchy errors [lines\|-f]` | Show the last *N* lines of the Apache error log (default 20), or follow with `-f`. |
 | `patchy refresh-certs` | Regenerate all local SSL certificates. |
-| `patchy setup` | One-time setup: Apache user, ports 80/443, required modules, PHP handler, vhost include. Idempotent; auto-run by `brew install`. |
+| `patchy setup` | One-time setup: Apache user, ports 80/443, required modules, PHP handler, vhost include, DNS resolver. Idempotent; auto-run by `brew install`. |
 | `patchy help` | Print all of the above. |
 
 ### Editor
@@ -114,17 +115,34 @@ If your stack targets Nginx + FPM, Valet or Herd will probably serve you better.
 
 - macOS
 - [Homebrew](https://brew.sh)
-- `sudo` access — only used to update `/etc/hosts` via `hostess`
+- `sudo` access — used once during `patchy setup` (writes `/etc/resolver/test`, migrates old `/etc/hosts` entries), once per additional TLD, and on `add`/`rm`/`start`/`stop` only if you use `.local` sites
 - `zsh` (the default shell on modern macOS)
 
 > **Note:** Apache binds ports 80/443 with a wildcard bind, which needs no root on modern macOS but is reachable from your local network (handy for testing from a phone). The macOS firewall may ask once to allow `httpd`.
 
+> **Upgrading from hostess-based Patchy (≤ v0.3.0)?** Run `patchy setup` once after upgrading. It configures dnsmasq, writes `/etc/resolver/<tld>` files for your existing sites, and removes the old `/etc/hosts` entries (one sudo prompt). Until you do, sites keep working the old way but DNS won't stop with `patchy stop`.
+
+### How DNS works
+
+Patchy runs [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) as a user-level Homebrew service on port 53535, answering `*.test` (and any other TLD you add) with `127.0.0.1`. macOS routes those TLDs to it via `/etc/resolver/<tld>` files. Because resolution comes from a running service instead of `/etc/hosts`, your `.test` domains stop resolving the moment you run `patchy stop` — and nothing needs sudo day-to-day. Adding a site under a brand-new TLD prompts once: a resolver file captures the *entire* TLD, so stick to made-up TLDs like `.test`.
+
+**`.local` sites are special.** macOS reserves `.local` for Bonjour/mDNS (printers, AirDrop, other Macs), so Patchy never routes it through dnsmasq. Instead, `.local` sites get exact entries in `/etc/hosts` tagged `# patchy` — added on `patchy start`, removed on `patchy stop`, so stop/start behavior matches every other site. The tradeoff: `.local` sites need a sudo password on `add`/`rm`/`start`/`stop`. Patchy tells you when a prompt is due to `.local` sites; moving them to `.test` removes the prompts entirely.
+
 ## Uninstall
 
 ```bash
-# (Optional) remove sites first — cleans up /etc/hosts entries and certs
+# (Optional) remove sites first — cleans up certs
 patchy list                              # see what's configured
 patchy rm <domain> [<domain>...]         # remove one or more sites
+
+# Stop services
+patchy stop
+
+# Remove the macOS resolver files patchy created (one per TLD)
+sudo rm /etc/resolver/test               # plus any other TLDs you added
+
+# Remove patchy-managed .local entries (only if you used .local sites)
+sudo sed -i '' '/# patchy$/d' /etc/hosts
 
 # Uninstall Patchy
 brew uninstall joeworkman/patchy/patchy
