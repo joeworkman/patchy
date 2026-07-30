@@ -695,25 +695,35 @@ function list_sites() {
         red=$'\e[31m'
         reset=$'\e[0m'
     fi
-    printf "%-32s %-50s %s\n" "DOMAIN" "DOCROOT" "HTTPS"
+    local dwidth=6
+    while IFS= read -r domain; do
+        (( ${#domain} > dwidth )) && dwidth=${#domain}
+    done < <(list_domains)
+    (( dwidth += 3 ))
+    printf "%-${dwidth}s %-8s %s\n" "DOMAIN" "HTTPS" "DOCROOT"
     while IFS= read -r domain; do
         docroot=$(sed -n 's/^[[:space:]]*DocumentRoot[[:space:]]*"\(.*\)".*/\1/p' "$VHOSTS_DIR/$domain.conf" | head -n1)
         docroot="${docroot/#$HOME/~}"
+        local color=""
         if [ ! -f "$CERT_DIR/$domain.pem" ]; then
             https="no"
         elif ! days=$(cert_days_left "$CERT_DIR/$domain.pem"); then
-            https="${red}invalid${reset}"
+            https="invalid"
+            color=$red
             needs_attention=1
         elif [ "$days" -lt 0 ]; then
-            https="${red}expired${reset}"
+            https="expired"
+            color=$red
             needs_attention=1
         elif [ "$days" -le 30 ]; then
-            https="${orange}${days}d${reset}"
+            https="${days}d"
+            color=$orange
             needs_attention=1
         else
             https="${days}d"
         fi
-        printf "%-32s %-50s %s\n" "$domain" "$docroot" "$https"
+        # color applied outside the padding so escape codes don't skew column width
+        printf "%-${dwidth}s ${color}%-8s${reset} %s\n" "$domain" "$https" "$docroot"
     done < <(list_domains)
     if [ "$needs_attention" -eq 1 ]; then
         echo ""
