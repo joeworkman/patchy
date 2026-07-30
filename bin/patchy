@@ -42,13 +42,35 @@ RESOLVER_DIR="/etc/resolver"
 # Script name for help text (zsh's $0 resolves to function name inside functions)
 SCRIPT_NAME="${0:t}"
 
+# Resolved script path, captured at top level for the same $0 reason
+SCRIPT_PATH="${0:A}"
+
+# Version is derived, never stored: brew runs from a versioned Cellar path;
+# source installs report git describe from the clone
+function patchy_version() {
+    case "$SCRIPT_PATH" in
+        */Cellar/patchy/*)
+            local v="${SCRIPT_PATH#*/Cellar/patchy/}"
+            echo "${v%%/*}"
+            return 0
+            ;;
+    esac
+    local gitv
+    gitv=$(git -C "${SCRIPT_PATH:h}" describe --tags 2>/dev/null)
+    if [ -n "$gitv" ]; then
+        echo "${gitv#v}"
+    else
+        echo "dev"
+    fi
+}
+
 # Path of the most recent httpd.conf backup (set by backup_config)
 LAST_BACKUP=""
 
 # Function to display help message
 function show_help() {
     cat <<EOF
-Patchy — a patchy little PHP dev server for macOS (running Apache)
+Patchy v$(patchy_version) — a patchy little PHP dev server for macOS (running Apache)
 
 Usage: $SCRIPT_NAME {command} [options]
 
@@ -69,6 +91,7 @@ Commands:
   check               Verify the Apache and PHP configuration
 
   info                Display Apache and PHP version information
+  version             Display the Patchy version
   php <version>       Switch to the specified PHP version. You must have it installed via Homebrew.
   pecl                Install common PECL extensions (redis, apcu, imagick, yaml, pcov, memcached)
   refresh-certs       Refresh the SSL certificates
@@ -1076,6 +1099,9 @@ case "${1:-}" in
         server_info
         echo ""
         php_info
+        ;;
+    version|--version|-v)
+        echo "patchy $(patchy_version)"
         ;;
     php)
         switch_php_version "${2:-}"

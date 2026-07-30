@@ -66,6 +66,7 @@ patchy rm example.test
 | `patchy status` | Show whether Apache and DNS are running. |
 | `patchy check` | Verify Apache and PHP config. |
 | `patchy info` | Show Apache and PHP version info. |
+| `patchy version` | Show the Patchy version. |
 | `patchy php <version>` | Switch the active PHP version (e.g. `patchy php 8.4`). |
 | `patchy pecl` | Install common PECL extensions for the current PHP. |
 | `patchy config` | Open `httpd.conf` in your editor. |
