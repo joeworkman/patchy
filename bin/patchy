@@ -665,6 +665,16 @@ function refresh_certs() {
     done
 }
 
+function cert_days_left() {
+    local cert=$1 end_date end_epoch secs
+    end_date=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null) || return 1
+    end_date=${end_date#notAfter=}
+    # %e not %d: openssl space-pads single-digit days ("Sep  9")
+    end_epoch=$(date -j -f "%b %e %T %Y %Z" "$end_date" +%s 2>/dev/null) || return 1
+    secs=$(( end_epoch - $(date +%s) ))
+    echo $(( secs < 0 ? (secs - 86399) / 86400 : secs / 86400 ))
+}
+
 function list_domains() {
     [ -d "$VHOSTS_DIR" ] || return 0
     local f
@@ -678,18 +688,37 @@ function list_sites() {
         echo "No sites configured."
         return 0
     fi
-    local domain docroot has_https
+    local domain docroot https days needs_attention=0
+    local orange="" red="" reset=""
+    if [ -t 1 ]; then
+        orange=$'\e[38;5;208m'
+        red=$'\e[31m'
+        reset=$'\e[0m'
+    fi
     printf "%-32s %-50s %s\n" "DOMAIN" "DOCROOT" "HTTPS"
     while IFS= read -r domain; do
         docroot=$(sed -n 's/^[[:space:]]*DocumentRoot[[:space:]]*"\(.*\)".*/\1/p' "$VHOSTS_DIR/$domain.conf" | head -n1)
         docroot="${docroot/#$HOME/~}"
-        if [ -f "$CERT_DIR/$domain.pem" ]; then
-            has_https="yes"
+        if [ ! -f "$CERT_DIR/$domain.pem" ]; then
+            https="no"
+        elif ! days=$(cert_days_left "$CERT_DIR/$domain.pem"); then
+            https="${red}invalid${reset}"
+            needs_attention=1
+        elif [ "$days" -lt 0 ]; then
+            https="${red}expired${reset}"
+            needs_attention=1
+        elif [ "$days" -le 30 ]; then
+            https="${orange}${days}d${reset}"
+            needs_attention=1
         else
-            has_https="no"
+            https="${days}d"
         fi
-        printf "%-32s %-50s %s\n" "$domain" "$docroot" "$has_https"
+        printf "%-32s %-50s %s\n" "$domain" "$docroot" "$https"
     done < <(list_domains)
+    if [ "$needs_attention" -eq 1 ]; then
+        echo ""
+        echo "Some certificates expire soon or are invalid. Run 'patchy refresh-certs' to regenerate them."
+    fi
 }
 
 function site_exists() {
