@@ -920,6 +920,11 @@ $php_line
         SetHandler application/x-httpd-php
     </FilesMatch>
 </IfModule>
+
+# Lets sites detect Patchy: \$_SERVER['PATCHY'] in PHP
+<IfModule env_module>
+    SetEnv PATCHY true
+</IfModule>
 EOF
     echo "Wrote $PATCHY_CONF"
 }

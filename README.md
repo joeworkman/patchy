@@ -17,6 +17,7 @@ Patchy is that environment: **Apache 2 + mod_php**, local HTTPS, friendly `.test
 - Local HTTPS via [mkcert](https://github.com/FiloSottile/mkcert) — no browser warnings
 - Friendly hostnames via a local [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) resolver — `*.test` resolves only while Patchy runs
 - Per-site error and access logs
+- `$_SERVER['PATCHY']` set for every request, so apps can detect local dev
 - Painless PHP version switching across installed Homebrew PHPs
 - One-shot PECL extension setup (`redis`, `apcu`, `imagick`, `yaml`, `pcov`, `memcached`)
 - A plain `httpd.conf` you can read and edit — no black box
