@@ -4,3 +4,4 @@
 *.swp
 .superpowers
 docs/superpowers
+/patchy.code-workspace
