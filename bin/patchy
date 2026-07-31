@@ -84,7 +84,7 @@ Commands:
   status              Display the status of the Apache and DNS servers
   start               Start the Apache and DNS servers
   stop                Stop the Apache and DNS servers
-  restart             Restart the Apache server
+  restart             Restart the Apache server (starts DNS if it is down)
 
   config              Edit the Apache configuration file
   ini                 Edit the PHP configuration file
@@ -130,6 +130,7 @@ function is_apache_running() {
 function restart_server() {
     echo "Restarting Apache server..."
     brew services restart httpd
+    ensure_dns_running
     # brew services returns 0 even if launchd fails to bring the process up.
     # Give it a moment and verify.
     local i
@@ -171,6 +172,16 @@ function stop_dns() {
 function restart_dns() {
     echo "Restarting DNS server..."
     brew services restart dnsmasq
+}
+
+# DNS config changes restart dnsmasq at the point of change (ensure_tld,
+# setup), so restart doesn't need to bounce it — but if dnsmasq died out
+# from under us (e.g. a brew services reload denied by launchd), revive it.
+function ensure_dns_running() {
+    dns_configured || return 0
+    is_dnsmasq_running && return 0
+    echo "DNS server is not running — starting it..."
+    brew services start dnsmasq
 }
 
 # TLDs patchy serves: .test always, every TLD with a configured site, and any

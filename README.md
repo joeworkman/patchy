@@ -62,7 +62,7 @@ patchy rm example.test
 | `patchy rm <domain>...` | Remove one or more sites. |
 | `patchy list` | List configured sites. |
 | `patchy start` / `stop` | Start/stop Apache and the DNS resolver together. |
-| `patchy restart` | Restart Apache (DNS keeps running). |
+| `patchy restart` | Restart Apache (DNS keeps running; started if it went down). |
 | `patchy status` | Show whether Apache and DNS are running. |
 | `patchy check` | Verify Apache and PHP config. |
 | `patchy info` | Show Apache and PHP version info. |
