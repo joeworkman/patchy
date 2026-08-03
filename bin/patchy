@@ -31,17 +31,18 @@ export LOG_DIR
 # Default parent directory for new site docroots
 DEFAULT_WEBROOT="$HOME/Websites"
 
-# dnsmasq answers wildcard *.tld lookups on an unprivileged port; macOS
-# routes each TLD to it via /etc/resolver/<tld> (written once, with sudo)
+# Legacy dnsmasq installs (pre-hosts migration) — referenced only by
+# migrate_dnsmasq/legacy_dns_hint so 'setup' can clean them up.
 DNSMASQ_PORT=53535
-DNSMASQ_CONF="$BREW_PREFIX/etc/dnsmasq.conf"
 DNSMASQ_DIR="$BREW_PREFIX/etc/dnsmasq.d"
 PATCHY_DNS_CONF="$DNSMASQ_DIR/patchy.conf"
 RESOLVER_DIR="/etc/resolver"
 
-# Set when a command deletes a resolver file; finalize_dns_changes applies
-# the matching dnsmasq-conf regeneration + restart + cache flush once.
-DNS_DIRTY=0
+# 'patchy trust' installs a root-owned helper + sudoers NOPASSWD rule so
+# /etc/hosts edits stop prompting for a password. Never point sudoers at
+# patchy itself — this script is user-writable, the helper is not.
+HELPER_PATH="/usr/local/libexec/patchy-hosts"
+SUDOERS_FILE="/etc/sudoers.d/patchy"
 
 # Script name for help text (zsh's $0 resolves to function name inside functions)
 SCRIPT_NAME="${0:t}"
@@ -85,11 +86,10 @@ Commands:
   add <domain> [dir]  Add a new site (docroot defaults to ~/Websites/<domain>)
   rm <domain>...      Remove one or more sites with the specified domains
 
-  status              Display the status of the Apache and DNS servers
-  start               Start the Apache and DNS servers
-  stop                Stop Apache; DNS keeps running in pass-through mode
-  stop dns            Stop the DNS server too (real-TLD sites go dark on this Mac)
-  restart             Restart the Apache server (revives DNS serving if needed)
+  status              Display the status of the Apache server and /etc/hosts routing
+  start               Start Apache and route site domains to this Mac (/etc/hosts)
+  stop                Stop Apache and release site domains back to public DNS
+  restart             Restart the Apache server and repair /etc/hosts routing
 
   config              Edit the Apache configuration file
   ini                 Edit the PHP configuration file
@@ -102,6 +102,8 @@ Commands:
   refresh-certs       Refresh the SSL certificates
 
   setup               One-time setup: Apache user, ports 80/443, modules, PHP handler, vhost include, DNS
+  trust               Let patchy update /etc/hosts without a sudo password
+  untrust             Remove the passwordless /etc/hosts helper
 
   errors [lines|-f]   Display the last [lines] of the Apache error log (default 20), or -f to follow
   logs                Tail the Apache logs
@@ -111,28 +113,49 @@ EOF
 function start_server() {
     echo "Starting Apache server..."
     brew services start httpd
-    start_dns
-    if [ -n "$(list_local_domains)" ]; then
-        local_sites_warning
-        hosts_restore_all || echo "Warning: some .local hosts entries were not restored. Re-run '$SCRIPT_NAME start'." >&2
+    sync_hosts_entries
+    legacy_dns_hint
+}
+
+function stop_server() {
+    echo "Stopping Apache server..."
+    brew services stop httpd
+    if hosts_active; then
+        hosts_sudo_note
+        if hosts_sync; then
+            echo "Released site domains back to public DNS."
+        else
+            echo "Warning: /etc/hosts entries were not removed; site domains still" >&2
+            echo "resolve to this Mac. Run '$SCRIPT_NAME stop' again to retry." >&2
+        fi
     fi
 }
 
-# "stop" leaves dnsmasq up in pass-through mode; "stop dns" shuts it down
-# too, for when nothing should be running (uninstall, port conflicts).
-function stop_server() {
-    local mode="${1:-}"
-    echo "Stopping Apache server..."
-    brew services stop httpd
-    if [ "$mode" = "dns" ]; then
-        stop_dns_full
-    else
-        stop_dns
+# /etc/hosts is the DNS layer: one marked line per configured site, applied
+# by macOS immediately — no daemon, no cache flush, no stale TTLs.
+function sync_hosts_entries() {
+    [ -n "$(list_domains)" ] || return 0
+    hosts_sudo_note
+    if ! hosts_sync $(list_domains); then
+        echo "Warning: /etc/hosts was not updated — sites will not resolve locally." >&2
+        echo "Run '$SCRIPT_NAME start' again to retry." >&2
+        return 1
     fi
-    if [ -n "$(list_local_domains)" ]; then
-        local_sites_warning
-        hosts_remove_all || echo "Warning: .local hosts entries were not removed; those names still resolve." >&2
-    fi
+}
+
+# Old installs routed DNS through dnsmasq via /etc/resolver files on our
+# port. /etc/hosts wins for configured names, but leftovers break other
+# lookups under those TLDs/domains — setup cleans them up.
+function legacy_dns_hint() {
+    local f
+    for f in "$RESOLVER_DIR"/*(N); do
+        if grep -qE "^port[[:space:]]+$DNSMASQ_PORT\$" "$f" 2>/dev/null; then
+            echo "Note: legacy dnsmasq resolver files found in $RESOLVER_DIR — run"
+            echo "'$SCRIPT_NAME setup' to finish migrating to /etc/hosts routing."
+            return 0
+        fi
+    done
+    return 0
 }
 
 function is_apache_running() {
@@ -142,7 +165,7 @@ function is_apache_running() {
 function restart_server() {
     echo "Restarting Apache server..."
     brew services restart httpd
-    ensure_dns_running
+    sync_hosts_entries
     # brew services returns 0 even if launchd fails to bring the process up.
     # Give it a moment and verify.
     local i
@@ -155,212 +178,6 @@ function restart_server() {
     return 1
 }
 
-function dns_configured() {
-    [ -f "$PATCHY_DNS_CONF" ]
-}
-
-function is_dnsmasq_running() {
-    brew services info dnsmasq --json 2>/dev/null | jq -e '.[0].running' >/dev/null 2>&1
-}
-
-function start_dns() {
-    if ! dns_configured; then
-        echo "DNS is not configured — run '$SCRIPT_NAME setup'."
-        return 0
-    fi
-    if dns_passthrough; then
-        echo "Switching DNS back to serving local sites..."
-        write_dns_conf
-        restart_dns
-        stale_dns_note
-    else
-        echo "Starting DNS server..."
-        brew services start dnsmasq
-    fi
-    ensure_resolver_files
-}
-
-# Resolver files can vanish out from under us (a manual `sudo rm`, cleanup
-# tools) and dnsmasq alone can't route anything without them — macOS would
-# send those lookups straight to public DNS. start re-creates any that are
-# missing, prompting for sudo only when something was actually deleted.
-function ensure_resolver_files() {
-    local name missing=()
-    for name in test $(list_real_domains); do
-        resolver_file_ok "$name" || missing+=("$name")
-    done
-    [ ${#missing[@]} -eq 0 ] && return 0
-    if [ ! -t 0 ]; then
-        echo "Warning: missing resolver file(s) for: ${(j:, :)missing} — those names" >&2
-        echo "resolve via public DNS, not this Mac. Run '$SCRIPT_NAME setup' to restore." >&2
-        return 0
-    fi
-    for name in "${missing[@]}"; do
-        write_resolver_file "$name" || return 1
-    done
-    flush_dns_cache
-}
-
-# Stopping dnsmasq outright would leave the /etc/resolver files routing
-# real-TLD domains to a dead port — macOS never falls back to public DNS
-# when the listed nameserver is down, so a live site like example.com
-# would be unreachable until its resolver file is deleted (sudo). Instead
-# dnsmasq stays up in pass-through mode: no local answers, everything
-# forwarded upstream, no password needed.
-function stop_dns() {
-    if ! dns_configured; then
-        echo "DNS is not configured — run '$SCRIPT_NAME setup'."
-        return 0
-    fi
-    echo "Switching DNS to pass-through mode (real domains resolve normally)..."
-    write_dns_conf passthrough
-    restart_dns
-}
-
-# Full DNS shutdown, explicitly requested via "stop dns". The resolver
-# files stay behind routing their domains to the now-dead port, and macOS
-# won't fall back to public DNS — warn exactly what goes dark.
-function stop_dns_full() {
-    if ! dns_configured; then
-        echo "DNS is not configured — run '$SCRIPT_NAME setup'."
-        return 0
-    fi
-    echo "Stopping DNS server..."
-    brew services stop dnsmasq
-    local name names=()
-    for name in $(list_legacy_tlds); do
-        names+=(".$name (entire TLD)")
-    done
-    for name in $(list_real_domains); do
-        names+=("$name")
-    done
-    [ ${#names[@]} -eq 0 ] && return 0
-    echo ""
-    echo "Warning: with DNS stopped, these domains are unreachable on this Mac —"
-    echo "including their live versions: ${(j:, :)names}"
-    echo "Run '$SCRIPT_NAME start' to serve them locally again, or '$SCRIPT_NAME rm <domain>'"
-    echo "to release a domain back to public DNS."
-}
-
-# macOS caches upstream answers fetched during pass-through with their
-# original TTLs, so a real-TLD site can keep resolving to its production
-# IP for a few minutes after start. Flushing needs sudo, so say how
-# instead of prompting.
-function stale_dns_note() {
-    [ -n "$(list_real_domains)" ] || return 0
-    echo "Note: if a real-TLD site still loads its production version, cached DNS"
-    echo "answers may take a few minutes to expire. To clear them now, run:"
-    echo "  sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"
-}
-
-function restart_dns() {
-    echo "Restarting DNS server..."
-    brew services restart dnsmasq
-}
-
-# DNS config changes restart dnsmasq at the point of change (ensure_dns_route,
-# setup), so restart doesn't need to bounce it — but if dnsmasq died out
-# from under us (e.g. a brew services reload denied by launchd), revive it,
-# and if a stop left it in pass-through mode, put it back to serving.
-function ensure_dns_running() {
-    dns_configured || return 0
-    if dns_passthrough; then
-        echo "DNS is in pass-through mode — switching back to serving local sites..."
-        write_dns_conf
-        restart_dns
-        stale_dns_note
-        ensure_resolver_files
-        return 0
-    fi
-    if ! is_dnsmasq_running; then
-        echo "DNS server is not running — starting it..."
-        brew services start dnsmasq
-    fi
-    ensure_resolver_files
-}
-
-# Rewrite the patchy-managed dnsmasq config in full. Serve mode (default):
-# the .test wildcard always, one exact line per real-TLD site, and a
-# TLD-wide wildcard for any lingering legacy /etc/resolver/<tld> file —
-# as long as that file routes the whole TLD here, the conf must answer for
-# it or every lookup under the TLD breaks. Pass-through mode answers
-# nothing locally and forwards upstream via /etc/resolv.conf instead, so
-# the /etc/resolver files (root-owned; deleting them needs sudo) keep
-# pointing at a nameserver that returns real answers while patchy is
-# stopped. Regeneration is also the teardown path — lines for removed
-# sites simply aren't re-emitted. Port 53535 is unprivileged, so dnsmasq
-# runs as the user — no sudo, no system daemon.
-function write_dns_conf() {
-    local mode="${1:-serve}"
-    mkdir -p "$DNSMASQ_DIR"
-    local domain tld
-    {
-        echo "# Managed by Patchy — do not edit."
-        [ "$mode" = "passthrough" ] && echo "# mode: pass-through"
-        echo ""
-        echo "port=$DNSMASQ_PORT"
-        echo "listen-address=127.0.0.1"
-        echo "bind-interfaces"
-        if [ "$mode" != "passthrough" ]; then
-            echo "no-resolv"
-            echo "address=/.test/127.0.0.1"
-            for tld in $(list_legacy_tlds); do
-                echo "address=/.$tld/127.0.0.1"
-            done
-            for domain in $(list_real_domains); do
-                echo "address=/$domain/127.0.0.1"
-            done
-        fi
-    } > "$PATCHY_DNS_CONF"
-    echo "Wrote $PATCHY_DNS_CONF"
-}
-
-function dns_passthrough() {
-    grep -qxF "# mode: pass-through" "$PATCHY_DNS_CONF" 2>/dev/null
-}
-
-# Pre-per-domain versions routed whole TLDs via /etc/resolver/<tld>; setup
-# migrates these away, but one whose removal failed (sudo declined) still
-# captures its entire TLD. The resolver dir is the source of truth: a
-# single-label file on our port is a TLD-wide route. (.test is ours by
-# design; .local is cleaned up by setup.)
-function list_legacy_tlds() {
-    local f name
-    for f in "$RESOLVER_DIR"/*(N); do
-        name="${f:t}"
-        case "$name" in
-            test|local|*.*) continue ;;
-        esac
-        resolver_file_ok "$name" && echo "$name"
-    done
-    return 0
-}
-
-# Homebrew's dnsmasq.conf ships with conf-dir commented out; enable it so
-# dnsmasq picks up $PATCHY_DNS_CONF
-function ensure_dnsmasq_confdir() {
-    local line="conf-dir=$DNSMASQ_DIR/,*.conf"
-    if [ -n "$(active_line_no "conf-dir=$DNSMASQ_DIR" "$DNSMASQ_CONF")" ]; then
-        return 0
-    fi
-    echo "$line" >> "$DNSMASQ_CONF"
-    echo "Enabled conf-dir in $DNSMASQ_CONF"
-}
-
-function write_resolver_file() {
-    local name=$1
-    echo "Configuring macOS to route $name lookups to Patchy (requires sudo)..."
-    sudo mkdir -p "$RESOLVER_DIR" || return 1
-    printf 'nameserver 127.0.0.1\nport %s\n' "$DNSMASQ_PORT" | sudo tee "$RESOLVER_DIR/$name" >/dev/null || return 1
-}
-
-# A resolver file only counts if it routes to our port — a stale file from
-# another tool (e.g. Valet) would silently send lookups to the wrong port
-function resolver_file_ok() {
-    local name=$1
-    grep -qE "^port[[:space:]]+$DNSMASQ_PORT\$" "$RESOLVER_DIR/$name" 2>/dev/null
-}
-
 # macOS caches DNS answers with their original TTLs; a routing change
 # (resolver file added or removed) doesn't purge them, so a just-added
 # domain can keep resolving to its live IP for minutes without this.
@@ -370,155 +187,207 @@ function flush_dns_cache() {
     sudo killall -HUP mDNSResponder
 }
 
-# Configured sites that need per-domain routing (everything except the
-# .test wildcard and hosts-managed .local)
-function list_real_domains() {
-    local domain
-    for domain in $(list_domains); do
-        is_local_domain "$domain" && continue
-        [ "${domain##*.}" = "test" ] && continue
-        echo "$domain"
-    done
-    return 0
-}
-
-# Delete a per-domain resolver file if it's ours (never another tool's).
-# Callers run this BEFORE touching anything else so a declined sudo aborts
-# the whole removal cleanly.
-function remove_resolver_file() {
-    local domain=$1
-    resolver_file_ok "$domain" || return 0
-    echo "Removing $RESOLVER_DIR/$domain (requires sudo)..."
-    sudo rm -f "$RESOLVER_DIR/$domain" || return 1
-    DNS_DIRTY=1
-}
-
-# Once per command, not per domain: rebuild the dnsmasq conf from the
-# surviving sites, bounce dnsmasq, drop stale macOS answers. Keeps the
-# current mode so an rm while stopped doesn't flip DNS back to serving.
-function finalize_dns_changes() {
-    [ "$DNS_DIRTY" -eq 1 ] || return 0
-    DNS_DIRTY=0
-    if dns_passthrough; then
-        write_dns_conf passthrough
-    else
-        write_dns_conf
-    fi
-    restart_dns
-    flush_dns_cache
-}
-
-# .local sites live in /etc/hosts as exact names (Bonjour-safe): macOS
-# reserves .local for mDNS, so a dnsmasq resolver file would hijack the
-# whole TLD from device discovery. Entries carry a trailing "# patchy"
-# marker so patchy can add/remove them without touching anything else.
-function is_local_domain() {
-    [ "${1##*.}" = "local" ]
-}
-
-function list_local_domains() {
-    local domain
-    for domain in $(list_domains); do
-        is_local_domain "$domain" && echo "$domain"
-    done
-    return 0
-}
-
-function local_sites_warning() {
-    echo "Password prompt ahead: these .local sites are managed via /etc/hosts,"
-    echo "which needs sudo: $(list_local_domains | tr '\n' ' ')"
-    echo "Moving them to .test (or another TLD) removes this prompt."
-}
-
+# Every site lives in /etc/hosts as an exact name with a trailing "# patchy"
+# marker, so patchy can rewrite its own entries without touching anything
+# else. (.local names are Bonjour-safe here — exact hosts entries don't
+# capture the TLD the way a resolver file would.)
 function hosts_entry_exists() {
     local escaped="${1//./\\.}"
     grep -qE "^127\.0\.0\.1[[:space:]]+${escaped}[[:space:]]*# patchy\$" /etc/hosts
 }
 
-function hosts_add_entry() {
-    local domain=$1
-    hosts_entry_exists "$domain" && return 0
-    echo "127.0.0.1 $domain # patchy" | sudo tee -a /etc/hosts >/dev/null
+function hosts_active() {
+    grep -qE '# patchy$' /etc/hosts
 }
 
-function hosts_remove_entry() {
-    local escaped="${1//./\\.}"
-    hosts_entry_exists "$1" || return 0
-    sudo sed -i '' -E "/^127\.0\.0\.1[[:space:]]+${escaped}[[:space:]]*# patchy\$/d" /etc/hosts
+# Passwordless mode is usable only if the helper exists AND sudo lets us run
+# it without a password ('patchy trust' installs both).
+function trust_active() {
+    [ -x "$HELPER_PATH" ] && sudo -n "$HELPER_PATH" check >/dev/null 2>&1
 }
 
-# stop: drop every patchy-marked entry in one edit
-function hosts_remove_all() {
-    grep -qF "# patchy" /etc/hosts || return 0
-    sudo sed -i '' '/# patchy$/d' /etc/hosts
+function hosts_sudo_note() {
+    trust_active && return 0
+    echo "Password prompt ahead: patchy routes domains via /etc/hosts, which needs"
+    echo "sudo. Run '$SCRIPT_NAME trust' once to stop these prompts."
 }
 
-# start: regenerate marked entries for all configured .local sites
-function hosts_restore_all() {
-    local domain
-    for domain in $(list_local_domains); do
-        hosts_add_entry "$domain" || return 1
+# The single /etc/hosts writer: make the "# patchy" lines match exactly the
+# given domains. Desired-state (not add/remove deltas) so every caller
+# regenerates from the same source of truth. Tries the trust helper first;
+# falls back to inline sudo with a normal password prompt.
+function hosts_sync() {
+    if trust_active && sudo -n "$HELPER_PATH" sync "$@"; then
+        return 0
+    fi
+    hosts_sync_inline "$@"
+}
+
+# Inline fallback: rebuild to a temp file, then atomically install over
+# /etc/hosts (never truncate-in-place — a half-written hosts file kills all
+# name resolution).
+function hosts_sync_inline() {
+    local domain tmp
+    tmp=$(mktemp) || return 1
+    {
+        grep -v '# patchy$' /etc/hosts
+        for domain in "$@"; do
+            echo "127.0.0.1 $domain # patchy"
+        done
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    sudo /usr/bin/install -m 644 -o root -g wheel "$tmp" /etc/hosts
+    local rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
+# Sync the configured list ± one domain — used by add/rm, where the vhost
+# file for the domain in question doesn't exist yet / still exists.
+function hosts_add() {
+    hosts_sync $(list_domains) "$1"
+}
+
+function hosts_remove() {
+    local domain=$1 d keep=()
+    for d in $(list_domains); do
+        [ "$d" = "$domain" ] || keep+=("$d")
     done
+    hosts_sync "${keep[@]}"
 }
 
-function tld_configured() {
-    local tld=$1
-    resolver_file_ok "$tld" && grep -qF "address=/.$tld/" "$PATCHY_DNS_CONF" 2>/dev/null
+# The helper is the ONLY thing sudoers whitelists, so it must be minimal,
+# root-owned, and impossible to talk into editing anything but our marked
+# lines. Emitted here so patchy stays a single distributable file.
+function write_hosts_helper() {
+    cat <<'EOF'
+#!/bin/sh
+# patchy-hosts — installed root-owned by 'patchy trust'.
+# Rewrites the "# patchy" marked lines of /etc/hosts and nothing else.
+set -eu
+
+[ "$(id -u)" -eq 0 ] || { echo "patchy-hosts must run as root (via sudo)" >&2; exit 1; }
+
+case "${1:-}" in
+    check) exit 0 ;;
+    sync) shift ;;
+    *) echo "usage: patchy-hosts sync [domain ...]" >&2; exit 64 ;;
+esac
+
+for domain in "$@"; do
+    case "$domain" in
+        ''|*[!a-zA-Z0-9.-]*|-*|.*|*-|*.|*..*)
+            echo "patchy-hosts: invalid domain: $domain" >&2
+            exit 64
+            ;;
+    esac
+done
+
+# Same filesystem as /etc/hosts so mv is atomic — a half-written hosts
+# file would kill all name resolution.
+tmp=$(mktemp /etc/hosts.patchy.XXXXXX)
+trap 'rm -f "$tmp"' EXIT
+grep -v '# patchy$' /etc/hosts > "$tmp" || true
+for domain in "$@"; do
+    printf '127.0.0.1 %s # patchy\n' "$domain" >> "$tmp"
+done
+chmod 644 "$tmp"
+chown root:wheel "$tmp"
+mv "$tmp" /etc/hosts
+trap - EXIT
+EOF
 }
 
-# Per-domain analogue of tld_configured for real-TLD sites
-function domain_routed() {
-    local domain=$1
-    resolver_file_ok "$domain" && grep -qF "address=/$domain/" "$PATCHY_DNS_CONF" 2>/dev/null
+# The sudoers rule installed by trust_patchy grants passwordless root to
+# whoever can produce the file at $HELPER_PATH, so every directory in that
+# path must be root-controlled — otherwise a non-root owner of an ancestor
+# directory (e.g. a user/admin-writable /usr/local on Intel Homebrew) could
+# swap in their own "helper" and the sudoers rule would run it as root.
+function assert_root_owned_path() {
+    local dir=$1 info uid perm group_bit other_bit
+    info=$(stat -f '%u %Lp' "$dir" 2>/dev/null) || {
+        echo "Error: cannot stat $dir; trust cannot be safely installed." >&2
+        return 1
+    }
+    uid=${info%% *}
+    perm=${info##* }
+    group_bit=${perm[-2]}
+    other_bit=${perm[-1]}
+    if [ "$uid" -ne 0 ] || (( (group_bit & 2) || (other_bit & 2) )); then
+        echo "Error: $dir is owned by uid $uid with mode $perm — writable by" >&2
+        echo "non-root, so trust cannot be safely installed. The sudoers rule" >&2
+        echo "trusts the path $HELPER_PATH, and anyone able to write to $dir" >&2
+        echo "could substitute their own helper and gain passwordless root." >&2
+        echo "Normal sudo-prompt mode (without 'trust') still works fine." >&2
+        return 1
+    fi
 }
 
-# add while stopped: the resolver file is written now (so sudo happens at
-# add time, same as always) but the serve conf isn't touched — start
-# regenerates it from the vhost list, picking this domain up.
-function passthrough_route_note() {
-    echo "DNS is in pass-through mode while the server is stopped; the domain"
-    echo "will resolve to this Mac after '$SCRIPT_NAME start'."
-}
-
-# Route a domain's DNS before creating the site. .test rides a TLD-wide
-# wildcard (one resolver file, ever); real TLDs get exact per-domain
-# routing so the rest of the TLD stays on public DNS — a resolver file
-# named for a domain captures that domain and its subdomains only.
-# .local never reaches here (hosts-managed in add_site).
-function ensure_dns_route() {
-    local domain=$1
-    local tld="${domain##*.}"
-
-    if ! dns_configured; then
-        echo "DNS is not configured — run '$SCRIPT_NAME setup' first."
+function trust_patchy() {
+    if [ ! -t 0 ]; then
+        echo "Run '$SCRIPT_NAME trust' in an interactive terminal (needs sudo)." >&2
         return 1
     fi
 
-    if [ "$tld" = "test" ]; then
-        tld_configured "test" && return 0
-        if dns_passthrough; then
-            if ! resolver_file_ok "test"; then
-                write_resolver_file "test" || return 1
-            fi
-            passthrough_route_note
-            return 0
-        fi
-        echo "Setting up DNS for .test domains..."
-        echo "address=/.test/127.0.0.1" >> "$PATCHY_DNS_CONF"
-        if ! write_resolver_file "test"; then
-            sed -i '' '\|^address=/\.test/127\.0\.0\.1$|d' "$PATCHY_DNS_CONF"
-            echo "DNS setup for .test was not completed." >&2
-            return 1
-        fi
-        restart_dns
-        flush_dns_cache
-        return 0
+    local ancestor
+    for ancestor in /usr /usr/local "${HELPER_PATH:h}"; do
+        [ -d "$ancestor" ] || continue
+        assert_root_owned_path "$ancestor" || return 1
+    done
+
+    echo "Installing the patchy-hosts helper and sudoers rule (requires sudo)."
+    echo "Afterwards patchy can update /etc/hosts without a password prompt."
+
+    local user tmp_helper tmp_sudoers
+    user=$(whoami)
+    tmp_helper=$(mktemp) || return 1
+    write_hosts_helper > "$tmp_helper" || { rm -f "$tmp_helper"; return 1; }
+    if [ ! -s "$tmp_helper" ]; then
+        echo "Error: generated helper script is empty; nothing installed." >&2
+        rm -f "$tmp_helper"
+        return 1
+    fi
+    tmp_sudoers=$(mktemp) || { rm -f "$tmp_helper"; return 1; }
+    printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$HELPER_PATH" > "$tmp_sudoers"
+
+    # A malformed sudoers.d file can break sudo entirely — validate before
+    # anything is installed.
+    if ! visudo -cf "$tmp_sudoers" >/dev/null; then
+        echo "Error: generated sudoers rule failed validation; nothing installed." >&2
+        rm -f "$tmp_helper" "$tmp_sudoers"
+        return 1
     fi
 
-    domain_routed "$domain" && return 0
+    sudo /usr/bin/install -d -m 755 -o root -g wheel "${HELPER_PATH:h}" &&
+        sudo /usr/bin/install -m 755 -o root -g wheel "$tmp_helper" "$HELPER_PATH" &&
+        sudo /usr/bin/install -m 440 -o root -g wheel "$tmp_sudoers" "$SUDOERS_FILE"
+    local rc=$?
+    rm -f "$tmp_helper" "$tmp_sudoers"
+    if [ "$rc" -ne 0 ]; then
+        echo "Trust setup failed — run '$SCRIPT_NAME untrust' to remove any partial install." >&2
+        return 1
+    fi
+    echo "Done. start/stop/add/rm will no longer prompt for a password."
+}
 
-    echo "Routing $domain (and subdomains) to this Mac. If $domain is a real"
-    echo "website, it will be unreachable here until you run '$SCRIPT_NAME rm $domain'."
+function untrust_patchy() {
+    if [ ! -f "$SUDOERS_FILE" ] && [ ! -f "$HELPER_PATH" ]; then
+        echo "Trust is not installed."
+        return 0
+    fi
+    echo "Removing the sudoers rule and helper (requires sudo)..."
+    sudo rm -f "$SUDOERS_FILE" "$HELPER_PATH"
+    echo "Done. /etc/hosts updates will prompt for your password again."
+}
+
+# Routing a real domain hides its live site on this Mac — make sure that's
+# intended. .test is fake by definition and .local never leaves the LAN.
+function confirm_real_domain() {
+    local domain=$1
+    case "${domain##*.}" in
+        test|local) return 0 ;;
+    esac
+    echo "Routing $domain to this Mac. If $domain is a real website, it will be"
+    echo "unreachable here until you run '$SCRIPT_NAME rm $domain' or '$SCRIPT_NAME stop'."
     printf "Continue? [y/N] "
     local reply
     read -r reply
@@ -526,127 +395,73 @@ function ensure_dns_route() {
         y|Y|yes|YES) ;;
         *) echo "Aborted."; return 1 ;;
     esac
-
-    if dns_passthrough; then
-        if ! resolver_file_ok "$domain"; then
-            write_resolver_file "$domain" || return 1
-        fi
-        passthrough_route_note
-        return 0
-    fi
-
-    echo "Setting up DNS for $domain..."
-    echo "address=/$domain/127.0.0.1" >> "$PATCHY_DNS_CONF"
-    if ! write_resolver_file "$domain"; then
-        local escaped="${domain//./\\.}"
-        sed -i '' "\|^address=/$escaped/127\.0\.0\.1\$|d" "$PATCHY_DNS_CONF"
-        echo "DNS setup for $domain was not completed." >&2
-        return 1
-    fi
-    restart_dns
-    flush_dns_cache
 }
 
 # Migrate hostess-era /etc/hosts entries. hostess consolidates every name
 # onto one "127.0.0.1 localhost a b c…" line, so domains are matched as
 # whitespace-delimited tokens and removed token-wise — never line-wise.
-# .local sites are re-added as patchy-marked per-line entries (kept working;
-# macOS reserves .local for Bonjour so dnsmasq can't serve them).
 function migrate_hosts_entries() {
-    local domain escaped stale=() locals=()
+    local domain escaped stale=()
     local unmarked
     unmarked=$(grep -E '^[[:space:]]*127\.0\.0\.1[[:space:]]' /etc/hosts | grep -v '# patchy$')
     for domain in $(list_domains); do
         [ "$domain" = "localhost" ] && continue
         escaped="${domain//./\\.}"
         if echo "$unmarked" | grep -qE "[[:space:]]$escaped([[:space:]]|\$)"; then
-            if is_local_domain "$domain"; then
-                locals+=("$domain")
-            else
-                stale+=("$domain")
-            fi
+            stale+=("$domain")
         fi
     done
-    [ $(( ${#stale[@]} + ${#locals[@]} )) -eq 0 ] && return 0
-
-    echo "Migrating /etc/hosts entries (requires sudo)..."
-    echo "Backup: /etc/hosts.patchy-bkp"
-    sudo cp /etc/hosts /etc/hosts.patchy-bkp || return 1
-
+    [ ${#stale[@]} -eq 0 ] && return 0
+    echo "Migrating stale /etc/hosts entries..."
     local args=()
-    for domain in "${stale[@]}" "${locals[@]}"; do
+    for domain in "${stale[@]}"; do
         escaped="${domain//./\\.}"
         args+=(-e "/^[[:space:]]*127\.0\.0\.1[[:space:]]/{" \
                -e "/# patchy\$/!s/[[:space:]]+($escaped)([[:space:]]|\$)/\\2/g" \
                -e "}")
     done
     sudo sed -i '' -E "${args[@]}" /etc/hosts || return 1
-
-    local d
-    for d in "${locals[@]}"; do
-        hosts_add_entry "$d" || return 1
-    done
 }
 
-function setup_dns() {
+# Tear down the pre-v0.9 dnsmasq DNS layer. Patchy-owned resolver files are
+# identified by our port — other tools' files are never touched. dnsmasq
+# itself stays installed; uninstalling software is the user's call.
+function migrate_dnsmasq() {
+    local f found=0
+    for f in "$RESOLVER_DIR"/*(N); do
+        grep -qE "^port[[:space:]]+$DNSMASQ_PORT\$" "$f" 2>/dev/null || continue
+        found=1
+        echo "Removing legacy resolver file $f (requires sudo)..."
+        sudo rm -f "$f" || echo "Warning: could not remove $f — re-run '$SCRIPT_NAME setup' to retry." >&2
+    done
+    if [ -f "$PATCHY_DNS_CONF" ]; then
+        found=1
+        rm -f "$PATCHY_DNS_CONF"
+        echo "Removed $PATCHY_DNS_CONF"
+    fi
+    [ "$found" -eq 1 ] || return 0
+    if [ -d "$BREW_PREFIX/opt/dnsmasq" ]; then
+        echo "Stopping dnsmasq (no longer used by patchy)..."
+        brew services stop dnsmasq
+        echo "To remove it entirely: brew uninstall dnsmasq"
+    fi
+    # Answers cached from the dnsmasq era keep their TTLs; flush once so
+    # sites cut over to /etc/hosts immediately.
+    flush_dns_cache
+}
+
+function setup_hosts() {
     if [ ! -t 0 ]; then
-        echo "Skipping DNS configuration (no interactive terminal for sudo)."
-        echo "Run '$SCRIPT_NAME setup' in a terminal to finish DNS setup."
+        echo "Skipping /etc/hosts configuration (no interactive terminal for sudo)."
+        echo "Run '$SCRIPT_NAME setup' in a terminal to finish."
         return 0
     fi
-
-    if [ ! -d "$BREW_PREFIX/opt/dnsmasq" ]; then
-        echo "dnsmasq is not installed. Install it with: brew install dnsmasq" >&2
-        return 1
-    fi
-
-    echo "Configuring DNS (dnsmasq)..."
-
-    # Migrate pre-per-domain TLD-wide routing: delete each legacy
-    # /etc/resolver/<tld> file. One whose removal fails (sudo declined)
-    # stays in list_legacy_tlds, so write_dns_conf below keeps answering
-    # its wildcard — the conf never falls out of sync with what the
-    # resolver files are actually routing.
-    local tld
-    for tld in $(list_legacy_tlds); do
-        echo "Migrating .$tld from TLD-wide to per-domain routing..."
-        if ! sudo rm -f "$RESOLVER_DIR/$tld"; then
-            echo "Warning: could not remove $RESOLVER_DIR/$tld — DNS lookups for" >&2
-            echo ".$tld would BREAK if the wildcard were dropped from the dnsmasq" >&2
-            echo "config, so it's being kept for now. Re-run '$SCRIPT_NAME setup' to retry." >&2
-        fi
-    done
-
-    ensure_dnsmasq_confdir
-    write_dns_conf
-
-    local name
-    for name in test $(list_real_domains); do
-        if ! resolver_file_ok "$name"; then
-            write_resolver_file "$name" || return 1
-        fi
-    done
-
-    # Pre-amendment versions wrote /etc/resolver/local, hijacking Bonjour.
-    # Only remove it if it's ours (routes to our port).
-    if resolver_file_ok "local"; then
-        echo "Removing /etc/resolver/local (macOS reserves .local for Bonjour)..."
-        sudo rm -f "$RESOLVER_DIR/local" || return 1
-    fi
-
+    echo "Configuring /etc/hosts routing (requires sudo)..."
+    echo "Backup: /etc/hosts.patchy-bkp"
+    sudo cp /etc/hosts /etc/hosts.patchy-bkp || return 1
+    migrate_dnsmasq
     migrate_hosts_entries || return 1
-
-    echo "Starting DNS server..."
-    brew services restart dnsmasq
-    flush_dns_cache
-
-    local i
-    for i in 1 2 3; do
-        sleep 1
-        is_dnsmasq_running && return 0
-    done
-    echo "Warning: dnsmasq did not come up. Check: brew services info dnsmasq" >&2
-    return 1
+    hosts_sync $(list_domains) || return 1
 }
 
 function open_in_editor() {
@@ -801,14 +616,10 @@ function add_site() {
 
     echo "Adding a new site... $domain"
 
-    if is_local_domain "$domain"; then
-        echo "Heads up: .local sites are managed via /etc/hosts because macOS"
-        echo "reserves .local for Bonjour. This needs sudo now and on every"
-        echo "'patchy start/stop'. Use .test instead to avoid password prompts."
-        hosts_add_entry "$domain" || return 1
-    else
-        ensure_dns_route "$domain" || return 1
-    fi
+    confirm_real_domain "$domain" || return 1
+    # Hosts entry first: a declined sudo aborts before anything is created.
+    hosts_sudo_note
+    hosts_add "$domain" || return 1
 
     echo "Creating SSL certificates..."
     make_cert "$domain"
@@ -850,12 +661,10 @@ EOF
         echo "Rolling back site creation..."
         remove_domain "$domain"
         remove_cert "$domain"
-        finalize_dns_changes
         return 1
     fi
 
     restart_server
-    start_dns
 }
 
 function root_cert_exists() {
@@ -982,19 +791,16 @@ function remove_site() {
     remove_cert "$domain"
 }
 
-# Real-TLD DNS teardown runs FIRST: if sudo is declined the site is left
-# fully intact rather than half-removed. (.test wildcards are never torn
-# down by rm; .local rides /etc/hosts.)
+# Hosts teardown runs FIRST: a declined sudo leaves the site fully intact
+# rather than half-removed. While stopped there are no patchy lines, so
+# there is nothing to remove — and syncing then would wrongly resurrect
+# the other sites' entries.
 function remove_domain() {
     local domain=$1
-
-    if is_local_domain "$domain"; then
-        echo "Removing /etc/hosts entry (requires sudo)..."
-        hosts_remove_entry "$domain"
-    elif [ "${domain##*.}" != "test" ]; then
-        remove_resolver_file "$domain" || return 1
+    if hosts_active; then
+        echo "Updating /etc/hosts..."
+        hosts_remove "$domain" || return 1
     fi
-
     echo "Removing Apache config file..."
     rm -f "$VHOSTS_DIR/$domain.conf"
 }
@@ -1028,14 +834,21 @@ function server_status() {
     else
         echo "Apache: Stopped"
     fi
-    if ! dns_configured; then
-        echo "DNS:    Not configured (run '$SCRIPT_NAME setup')"
-    elif ! is_dnsmasq_running; then
-        echo "DNS:    Stopped"
-    elif dns_passthrough; then
-        echo "DNS:    Pass-through (forwarding upstream; local sites not served)"
+    local d domains=($(list_domains)) missing=()
+    for d in "${domains[@]}"; do
+        hosts_entry_exists "$d" || missing+=("$d")
+    done
+    if [ ${#domains[@]} -eq 0 ]; then
+        echo "Hosts:  No sites configured"
+    elif [ ${#missing[@]} -eq 0 ]; then
+        echo "Hosts:  Routing ${#domains[@]} site(s) to this Mac"
+    elif [ ${#missing[@]} -eq ${#domains[@]} ]; then
+        echo "Hosts:  Not routing (run '$SCRIPT_NAME start' to serve sites locally)"
     else
-        echo "DNS:    Running"
+        echo "Hosts:  Routing $(( ${#domains[@]} - ${#missing[@]} )) of ${#domains[@]} site(s) — run '$SCRIPT_NAME start' to repair"
+    fi
+    if trust_active; then
+        echo "Trust:  Passwordless /etc/hosts updates enabled"
     fi
 }
 
@@ -1263,11 +1076,6 @@ function detect_php_line() {
 }
 
 function run_setup() {
-    if [ ! -d "$BREW_PREFIX/opt/dnsmasq" ]; then
-        echo "dnsmasq is not installed. Install it with: brew install dnsmasq" >&2
-        return 1
-    fi
-
     echo "Configuring Patchy..."
     backup_config
     local backup="$LAST_BACKUP"
@@ -1294,7 +1102,7 @@ function run_setup() {
         return 1
     fi
 
-    setup_dns || return 1
+    setup_hosts || return 1
 
     echo "Patchy configured successfully. Backup of httpd.conf: $backup"
     echo "Run '$SCRIPT_NAME restart' to apply any changes."
@@ -1318,14 +1126,11 @@ case "${1:-}" in
         start_server
         ;;
     stop)
-        case "${2:-}" in
-            "") stop_server ;;
-            dns) stop_server dns ;;
-            *)
-                echo "Unknown stop option: $2 (did you mean '$SCRIPT_NAME stop dns'?)"
-                exit 1
-                ;;
-        esac
+        if [ -n "${2:-}" ]; then
+            echo "'stop' no longer takes options — DNS is managed via /etc/hosts automatically."
+            exit 1
+        fi
+        stop_server
         ;;
     restart)
         restart_server
@@ -1344,6 +1149,12 @@ case "${1:-}" in
         ;;
     setup)
         run_setup
+        ;;
+    trust)
+        trust_patchy
+        ;;
+    untrust)
+        untrust_patchy
         ;;
     list)
         echo "Sites configured on the Apache server..."
@@ -1369,7 +1180,6 @@ case "${1:-}" in
                 removed=1
             fi
         done
-        finalize_dns_changes
         if [ "$removed" -eq 1 ]; then
             restart_server
         fi
