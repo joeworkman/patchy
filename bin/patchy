@@ -39,6 +39,10 @@ DNSMASQ_DIR="$BREW_PREFIX/etc/dnsmasq.d"
 PATCHY_DNS_CONF="$DNSMASQ_DIR/patchy.conf"
 RESOLVER_DIR="/etc/resolver"
 
+# Set when a command deletes a resolver file; finalize_dns_changes applies
+# the matching dnsmasq-conf regeneration + restart + cache flush once.
+DNS_DIRTY=0
+
 # Script name for help text (zsh's $0 resolves to function name inside functions)
 SCRIPT_NAME="${0:t}"
 
@@ -174,7 +178,7 @@ function restart_dns() {
     brew services restart dnsmasq
 }
 
-# DNS config changes restart dnsmasq at the point of change (ensure_tld,
+# DNS config changes restart dnsmasq at the point of change (ensure_dns_route,
 # setup), so restart doesn't need to bounce it — but if dnsmasq died out
 # from under us (e.g. a brew services reload denied by launchd), revive it.
 function ensure_dns_running() {
@@ -184,26 +188,14 @@ function ensure_dns_running() {
     brew services start dnsmasq
 }
 
-# TLDs patchy serves: .test always, every TLD with a configured site, and any
-# TLD already in the dnsmasq config (removing a site never tears down its TLD)
-function list_tlds() {
-    local domain
-    {
-        echo "test"
-        for domain in $(list_domains); do
-            echo "${domain##*.}"
-        done
-        sed -n 's|^address=/\.\(.*\)/127\.0\.0\.1$|\1|p' "$PATCHY_DNS_CONF" 2>/dev/null
-    } | sort -u | grep -v '^local$'
-    return 0
-}
-
-# Rewrite the patchy-managed dnsmasq config in full. Port 53535 is
-# unprivileged, so dnsmasq runs as the user — no sudo, no system daemon.
+# Rewrite the patchy-managed dnsmasq config in full: the .test wildcard
+# always, plus one exact line per real-TLD site. Regeneration is also the
+# teardown path — lines for removed sites (and legacy TLD wildcards) simply
+# aren't re-emitted. Port 53535 is unprivileged, so dnsmasq runs as the
+# user — no sudo, no system daemon.
 function write_dns_conf() {
     mkdir -p "$DNSMASQ_DIR"
-    local tlds tld
-    tlds=$(list_tlds)
+    local domain
     {
         echo "# Managed by Patchy — do not edit."
         echo ""
@@ -211,8 +203,9 @@ function write_dns_conf() {
         echo "listen-address=127.0.0.1"
         echo "bind-interfaces"
         echo "no-resolv"
-        for tld in ${(f)tlds}; do
-            echo "address=/.$tld/127.0.0.1"
+        echo "address=/.test/127.0.0.1"
+        for domain in $(list_real_domains); do
+            echo "address=/$domain/127.0.0.1"
         done
     } > "$PATCHY_DNS_CONF"
     echo "Wrote $PATCHY_DNS_CONF"
@@ -230,17 +223,59 @@ function ensure_dnsmasq_confdir() {
 }
 
 function write_resolver_file() {
-    local tld=$1
-    echo "Configuring macOS to resolve .$tld domains (requires sudo)..."
+    local name=$1
+    echo "Configuring macOS to route $name lookups to Patchy (requires sudo)..."
     sudo mkdir -p "$RESOLVER_DIR" || return 1
-    printf 'nameserver 127.0.0.1\nport %s\n' "$DNSMASQ_PORT" | sudo tee "$RESOLVER_DIR/$tld" >/dev/null || return 1
+    printf 'nameserver 127.0.0.1\nport %s\n' "$DNSMASQ_PORT" | sudo tee "$RESOLVER_DIR/$name" >/dev/null || return 1
 }
 
 # A resolver file only counts if it routes to our port — a stale file from
 # another tool (e.g. Valet) would silently send lookups to the wrong port
 function resolver_file_ok() {
-    local tld=$1
-    grep -qE "^port[[:space:]]+$DNSMASQ_PORT\$" "$RESOLVER_DIR/$tld" 2>/dev/null
+    local name=$1
+    grep -qE "^port[[:space:]]+$DNSMASQ_PORT\$" "$RESOLVER_DIR/$name" 2>/dev/null
+}
+
+# macOS caches DNS answers with their original TTLs; a routing change
+# (resolver file added or removed) doesn't purge them, so a just-added
+# domain can keep resolving to its live IP for minutes without this.
+function flush_dns_cache() {
+    echo "Flushing macOS DNS cache..."
+    sudo dscacheutil -flushcache
+    sudo killall -HUP mDNSResponder
+}
+
+# Configured sites that need per-domain routing (everything except the
+# .test wildcard and hosts-managed .local)
+function list_real_domains() {
+    local domain
+    for domain in $(list_domains); do
+        is_local_domain "$domain" && continue
+        [ "${domain##*.}" = "test" ] && continue
+        echo "$domain"
+    done
+    return 0
+}
+
+# Delete a per-domain resolver file if it's ours (never another tool's).
+# Callers run this BEFORE touching anything else so a declined sudo aborts
+# the whole removal cleanly.
+function remove_resolver_file() {
+    local domain=$1
+    resolver_file_ok "$domain" || return 0
+    echo "Removing $RESOLVER_DIR/$domain (requires sudo)..."
+    sudo rm -f "$RESOLVER_DIR/$domain" || return 1
+    DNS_DIRTY=1
+}
+
+# Once per command, not per domain: rebuild the dnsmasq conf from the
+# surviving sites, bounce dnsmasq, drop stale macOS answers.
+function finalize_dns_changes() {
+    [ "$DNS_DIRTY" -eq 1 ] || return 0
+    DNS_DIRTY=0
+    write_dns_conf
+    restart_dns
+    flush_dns_cache
 }
 
 # .local sites live in /etc/hosts as exact names (Bonjour-safe): macOS
@@ -301,10 +336,18 @@ function tld_configured() {
     resolver_file_ok "$tld" && grep -qF "address=/.$tld/" "$PATCHY_DNS_CONF" 2>/dev/null
 }
 
-# Make sure a domain's TLD is served before creating the site. A resolver
-# file captures the ENTIRE TLD, so new TLDs need explicit confirmation, and
-# .local is off-limits (macOS reserves it for Bonjour/mDNS).
-function ensure_tld() {
+# Per-domain analogue of tld_configured for real-TLD sites
+function domain_routed() {
+    local domain=$1
+    resolver_file_ok "$domain" && grep -qF "address=/$domain/" "$PATCHY_DNS_CONF" 2>/dev/null
+}
+
+# Route a domain's DNS before creating the site. .test rides a TLD-wide
+# wildcard (one resolver file, ever); real TLDs get exact per-domain
+# routing so the rest of the TLD stays on public DNS — a resolver file
+# named for a domain captures that domain and its subdomains only.
+# .local never reaches here (hosts-managed in add_site).
+function ensure_dns_route() {
     local domain=$1
     local tld="${domain##*.}"
 
@@ -313,33 +356,42 @@ function ensure_tld() {
         return 1
     fi
 
-    tld_configured "$tld" && return 0
-
-    if [ "$tld" != "test" ]; then
-        echo "The .$tld TLD is not set up yet."
-        echo ""
-        echo "Patchy resolves domains per-TLD: setting up .$tld routes EVERY"
-        echo ".$tld lookup on this Mac to 127.0.0.1 while Patchy is running."
-        echo "If .$tld is a real public TLD (like .dev or .app), real websites"
-        echo "under it will become unreachable. Made-up TLDs like .test are safe."
-        echo ""
-        printf "Set up .%s anyway? [y/N] " "$tld"
-        local reply
-        read -r reply
-        case "$reply" in
-            y|Y|yes|YES) ;;
-            *) echo "Aborted."; return 1 ;;
-        esac
+    if [ "$tld" = "test" ]; then
+        tld_configured "test" && return 0
+        echo "Setting up DNS for .test domains..."
+        echo "address=/.test/127.0.0.1" >> "$PATCHY_DNS_CONF"
+        if ! write_resolver_file "test"; then
+            sed -i '' '\|^address=/\.test/127\.0\.0\.1$|d' "$PATCHY_DNS_CONF"
+            echo "DNS setup for .test was not completed." >&2
+            return 1
+        fi
+        restart_dns
+        flush_dns_cache
+        return 0
     fi
 
-    echo "Setting up DNS for .$tld domains..."
-    echo "address=/.$tld/127.0.0.1" >> "$PATCHY_DNS_CONF"
-    if ! write_resolver_file "$tld"; then
-        sed -i '' "\|^address=/\.$tld/127\.0\.0\.1\$|d" "$PATCHY_DNS_CONF"
-        echo "DNS setup for .$tld was not completed." >&2
+    domain_routed "$domain" && return 0
+
+    echo "Routing $domain (and subdomains) to this Mac. If $domain is a real"
+    echo "website, it will be unreachable here until you run '$SCRIPT_NAME rm $domain'."
+    printf "Continue? [y/N] "
+    local reply
+    read -r reply
+    case "$reply" in
+        y|Y|yes|YES) ;;
+        *) echo "Aborted."; return 1 ;;
+    esac
+
+    echo "Setting up DNS for $domain..."
+    echo "address=/$domain/127.0.0.1" >> "$PATCHY_DNS_CONF"
+    if ! write_resolver_file "$domain"; then
+        local escaped="${domain//./\\.}"
+        sed -i '' "\|^address=/$escaped/127\.0\.0\.1\$|d" "$PATCHY_DNS_CONF"
+        echo "DNS setup for $domain was not completed." >&2
         return 1
     fi
     restart_dns
+    flush_dns_cache
 }
 
 # Migrate hostess-era /etc/hosts entries. hostess consolidates every name
@@ -396,13 +448,48 @@ function setup_dns() {
     fi
 
     echo "Configuring DNS (dnsmasq)..."
+
+    # Pre-per-domain versions wrote TLD-wide wildcards (address=/.com/…);
+    # capture them before write_dns_conf regenerates them away, so their
+    # /etc/resolver/<tld> files can be cleaned up below.
+    local legacy_tlds
+    legacy_tlds=$(sed -n 's|^address=/\.\(.*\)/127\.0\.0\.1$|\1|p' "$PATCHY_DNS_CONF" 2>/dev/null | grep -v -e '^test$' -e '^local$')
+
+    # Remove each legacy TLD-wide resolver file BEFORE the conf is
+    # regenerated below. A TLD whose file can't be removed (sudo declined)
+    # goes in failed_tlds so its wildcard line gets restored after
+    # write_dns_conf — /etc/resolver/<tld> still routes the whole TLD here,
+    # so the conf must keep answering for it or the next dnsmasq restart
+    # (this one, a reboot, a future stop+start) breaks every lookup under
+    # that TLD.
+    local tld failed_tlds=()
+    for tld in ${(f)legacy_tlds}; do
+        if resolver_file_ok "$tld"; then
+            echo "Migrating .$tld from TLD-wide to per-domain routing..."
+            if ! sudo rm -f "$RESOLVER_DIR/$tld"; then
+                failed_tlds+=("$tld")
+                echo "Warning: could not remove $RESOLVER_DIR/$tld — DNS lookups for" >&2
+                echo ".$tld would BREAK if the wildcard were dropped from the dnsmasq" >&2
+                echo "config, so it's being kept for now. Re-run '$SCRIPT_NAME setup' to retry." >&2
+            fi
+        fi
+    done
+
     ensure_dnsmasq_confdir
     write_dns_conf
 
-    local tld
-    for tld in $(list_tlds); do
-        if ! resolver_file_ok "$tld"; then
-            write_resolver_file "$tld" || return 1
+    # write_dns_conf unconditionally drops legacy wildcards; put back the
+    # ones still needed (removal above failed) so the conf never falls out
+    # of sync with what /etc/resolver/<tld> is actually routing — even if
+    # setup aborts on the very next line below.
+    for tld in "${failed_tlds[@]}"; do
+        echo "address=/.$tld/127.0.0.1" >> "$PATCHY_DNS_CONF"
+    done
+
+    local name
+    for name in test $(list_real_domains); do
+        if ! resolver_file_ok "$name"; then
+            write_resolver_file "$name" || return 1
         fi
     done
 
@@ -417,6 +504,7 @@ function setup_dns() {
 
     echo "Starting DNS server..."
     brew services restart dnsmasq
+    flush_dns_cache
 
     local i
     for i in 1 2 3; do
@@ -585,7 +673,7 @@ function add_site() {
         echo "'patchy start/stop'. Use .test instead to avoid password prompts."
         hosts_add_entry "$domain" || return 1
     else
-        ensure_tld "$domain" || return 1
+        ensure_dns_route "$domain" || return 1
     fi
 
     echo "Creating SSL certificates..."
@@ -628,6 +716,7 @@ EOF
         echo "Rolling back site creation..."
         remove_domain "$domain"
         remove_cert "$domain"
+        finalize_dns_changes
         return 1
     fi
 
@@ -755,16 +844,21 @@ function remove_site() {
         return 1
     fi
 
-    remove_domain "$domain"
+    remove_domain "$domain" || return 1
     remove_cert "$domain"
 }
 
+# Real-TLD DNS teardown runs FIRST: if sudo is declined the site is left
+# fully intact rather than half-removed. (.test wildcards are never torn
+# down by rm; .local rides /etc/hosts.)
 function remove_domain() {
     local domain=$1
 
     if is_local_domain "$domain"; then
         echo "Removing /etc/hosts entry (requires sudo)..."
         hosts_remove_entry "$domain"
+    elif [ "${domain##*.}" != "test" ]; then
+        remove_resolver_file "$domain" || return 1
     fi
 
     echo "Removing Apache config file..."
@@ -1132,6 +1226,7 @@ case "${1:-}" in
                 removed=1
             fi
         done
+        finalize_dns_changes
         if [ "$removed" -eq 1 ]; then
             restart_server
         fi

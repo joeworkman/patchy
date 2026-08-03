@@ -54,6 +54,23 @@ patchy add example.test developer/example.test
 patchy rm example.test
 ```
 
+## Using a real domain locally
+
+Adding a site under a real TLD (say `patchy add mywebsite.com`) routes **just
+that domain and its subdomains** to your Mac — the rest of `.com` stays on
+public DNS. Patchy asks for confirmation because the live site becomes
+unreachable on this Mac while the route exists. Both adding and removing a real-TLD site will prompt for your password to create or remove the resolver file.
+
+To get back to the live site, remove the site:
+
+```bash
+patchy rm mywebsite.com   # removes the vhost, certs, and the DNS route
+```
+
+Patchy flushes the macOS DNS cache on every routing change, but browsers keep
+their own DNS caches and connection pools — after switching a domain between
+local and live, a hard reload (or browser restart) may still be needed.
+
 ## Commands
 
 | Command | Description |
@@ -117,16 +134,16 @@ If your stack targets Nginx + FPM, Valet or Herd will probably serve you better.
 
 - macOS
 - [Homebrew](https://brew.sh)
-- `sudo` access — used once during `patchy setup` (writes `/etc/resolver/test`, migrates old `/etc/hosts` entries), once per additional TLD, and on `add`/`rm`/`start`/`stop` only if you use `.local` sites
+- `sudo` access — used once during `patchy setup` (writes `/etc/resolver/test`, migrates old `/etc/hosts` entries), once per new real-TLD domain on `add` and `rm` (to create/remove resolver files), and on `add`/`rm`/`start`/`stop` only if you use `.local` sites
 - `zsh` (the default shell on modern macOS)
 
 > **Note:** Apache binds ports 80/443 with a wildcard bind, which needs no root on modern macOS but is reachable from your local network (handy for testing from a phone). The macOS firewall may ask once to allow `httpd`.
 
-> **Upgrading from hostess-based Patchy (≤ v0.3.0)?** Run `patchy setup` once after upgrading. It configures dnsmasq, writes `/etc/resolver/<tld>` files for your existing sites, and removes the old `/etc/hosts` entries (one sudo prompt). Until you do, sites keep working the old way but DNS won't stop with `patchy stop`.
+> **Upgrading from hostess-based Patchy (≤ v0.3.0)?** Run `patchy setup` once after upgrading. It configures dnsmasq, writes `/etc/resolver/test` for `.test` sites and per-domain resolver files for real-TLD sites, migrates any older TLD-wide DNS setup to per-domain routing, and removes the old `/etc/hosts` entries (one sudo prompt). Until you do, sites keep working the old way but DNS won't stop with `patchy stop`.
 
 ### How DNS works
 
-Patchy runs [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) as a user-level Homebrew service on port 53535, answering `*.test` (and any other TLD you add) with `127.0.0.1`. macOS routes those TLDs to it via `/etc/resolver/<tld>` files. Because resolution comes from a running service instead of `/etc/hosts`, your `.test` domains stop resolving the moment you run `patchy stop` — and nothing needs sudo day-to-day. Adding a site under a brand-new TLD prompts once: a resolver file captures the *entire* TLD, so stick to made-up TLDs like `.test`.
+Patchy runs [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) as a user-level Homebrew service on port 53535, answering `*.test` with `127.0.0.1`. macOS routes those queries to it via `/etc/resolver/test`. For real TLDs (like `.com`), Patchy creates a resolver file for *just that domain*, so adding `mywebsite.com` only routes that domain and subdomains to localhost. Because resolution comes from a running service instead of `/etc/hosts`, your sites stop resolving the moment you run `patchy stop` — and nothing needs sudo day-to-day.
 
 **`.local` sites are special.** macOS reserves `.local` for Bonjour/mDNS (printers, AirDrop, other Macs), so Patchy never routes it through dnsmasq. Instead, `.local` sites get exact entries in `/etc/hosts` tagged `# patchy` — added on `patchy start`, removed on `patchy stop`, so stop/start behavior matches every other site. The tradeoff: `.local` sites need a sudo password on `add`/`rm`/`start`/`stop`. Patchy tells you when a prompt is due to `.local` sites; moving them to `.test` removes the prompts entirely.
 
@@ -140,8 +157,11 @@ patchy rm <domain> [<domain>...]         # remove one or more sites
 # Stop services
 patchy stop
 
-# Remove the macOS resolver files patchy created (one per TLD)
-sudo rm /etc/resolver/test               # plus any other TLDs you added
+# Remove the macOS resolver files patchy created
+sudo rm /etc/resolver/test                # the .test wildcard
+ls /etc/resolver                          # remove any per-domain files patchy
+                                          # created (contain "port 53535") —
+                                          # `patchy rm <site>` normally does this
 
 # Remove patchy-managed .local entries (only if you used .local sites)
 sudo sed -i '' '/# patchy$/d' /etc/hosts
