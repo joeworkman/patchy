@@ -78,7 +78,8 @@ local and live, a hard reload (or browser restart) may still be needed.
 | `patchy add <domain> [dir]` | Add a new site. Docroot defaults to `~/Websites/<domain>`. |
 | `patchy rm <domain>...` | Remove one or more sites. |
 | `patchy list` | List configured sites. |
-| `patchy start` / `stop` | Start/stop Apache and the DNS resolver together. |
+| `patchy start` / `stop` | Start/stop Apache. DNS serves local sites while running; `stop` switches it to pass-through so real domains resolve normally again. |
+| `patchy stop dns` | Stop Apache **and** dnsmasq. With DNS fully down, real-TLD sites are unreachable on this Mac (their resolver files route to a dead port) until `patchy start` or `patchy rm`. |
 | `patchy restart` | Restart Apache (DNS keeps running; started if it went down). |
 | `patchy status` | Show whether Apache and DNS are running. |
 | `patchy check` | Verify Apache and PHP config. |
@@ -145,6 +146,8 @@ If your stack targets Nginx + FPM, Valet or Herd will probably serve you better.
 
 Patchy runs [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) as a user-level Homebrew service on port 53535, answering `*.test` with `127.0.0.1`. macOS routes those queries to it via `/etc/resolver/test`. For real TLDs (like `.com`), Patchy creates a resolver file for *just that domain*, so adding `mywebsite.com` only routes that domain and subdomains to localhost. Because resolution comes from a running service instead of `/etc/hosts`, your sites stop resolving the moment you run `patchy stop` — and nothing needs sudo day-to-day.
 
+**What `patchy stop` does to DNS.** The `/etc/resolver` files are root-owned, and macOS never falls back to public DNS when the nameserver they point at is down — so if dnsmasq simply stopped, a real-TLD site like `mywebsite.com` would be unreachable (even its live production version) until the resolver file was deleted with sudo. Instead, `patchy stop` keeps dnsmasq running in **pass-through mode**: it answers nothing locally and forwards every query to your normal upstream DNS. Real domains resolve to their production IPs again, `.test` names stop resolving, and no password is ever needed. `patchy start` (or `restart`) switches it back to serving your local sites. Because dnsmasq stays registered with `brew services`, this survives reboots: after a restart it comes back in whatever mode it was left in. If you truly want dnsmasq off, `patchy stop dns` stops it and warns which real-TLD sites go dark. And if a resolver file ever goes missing (a manual `sudo rm`, a cleanup tool), `patchy start` notices and re-creates it — that's the only time start asks for a password.
+
 **`.local` sites are special.** macOS reserves `.local` for Bonjour/mDNS (printers, AirDrop, other Macs), so Patchy never routes it through dnsmasq. Instead, `.local` sites get exact entries in `/etc/hosts` tagged `# patchy` — added on `patchy start`, removed on `patchy stop`, so stop/start behavior matches every other site. The tradeoff: `.local` sites need a sudo password on `add`/`rm`/`start`/`stop`. Patchy tells you when a prompt is due to `.local` sites; moving them to `.test` removes the prompts entirely.
 
 ## Uninstall
@@ -154,8 +157,8 @@ Patchy runs [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) as a user-leve
 patchy list                              # see what's configured
 patchy rm <domain> [<domain>...]         # remove one or more sites
 
-# Stop services
-patchy stop
+# Stop everything, including dnsmasq
+patchy stop dns
 
 # Remove the macOS resolver files patchy created
 sudo rm /etc/resolver/test                # the .test wildcard

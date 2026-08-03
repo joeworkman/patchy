@@ -87,8 +87,9 @@ Commands:
 
   status              Display the status of the Apache and DNS servers
   start               Start the Apache and DNS servers
-  stop                Stop the Apache and DNS servers
-  restart             Restart the Apache server (starts DNS if it is down)
+  stop                Stop Apache; DNS keeps running in pass-through mode
+  stop dns            Stop the DNS server too (real-TLD sites go dark on this Mac)
+  restart             Restart the Apache server (revives DNS serving if needed)
 
   config              Edit the Apache configuration file
   ini                 Edit the PHP configuration file
@@ -117,10 +118,17 @@ function start_server() {
     fi
 }
 
+# "stop" leaves dnsmasq up in pass-through mode; "stop dns" shuts it down
+# too, for when nothing should be running (uninstall, port conflicts).
 function stop_server() {
+    local mode="${1:-}"
     echo "Stopping Apache server..."
     brew services stop httpd
-    stop_dns
+    if [ "$mode" = "dns" ]; then
+        stop_dns_full
+    else
+        stop_dns
+    fi
     if [ -n "$(list_local_domains)" ]; then
         local_sites_warning
         hosts_remove_all || echo "Warning: .local hosts entries were not removed; those names still resolve." >&2
@@ -160,17 +168,89 @@ function start_dns() {
         echo "DNS is not configured — run '$SCRIPT_NAME setup'."
         return 0
     fi
-    echo "Starting DNS server..."
-    brew services start dnsmasq
+    if dns_passthrough; then
+        echo "Switching DNS back to serving local sites..."
+        write_dns_conf
+        restart_dns
+        stale_dns_note
+    else
+        echo "Starting DNS server..."
+        brew services start dnsmasq
+    fi
+    ensure_resolver_files
 }
 
+# Resolver files can vanish out from under us (a manual `sudo rm`, cleanup
+# tools) and dnsmasq alone can't route anything without them — macOS would
+# send those lookups straight to public DNS. start re-creates any that are
+# missing, prompting for sudo only when something was actually deleted.
+function ensure_resolver_files() {
+    local name missing=()
+    for name in test $(list_real_domains); do
+        resolver_file_ok "$name" || missing+=("$name")
+    done
+    [ ${#missing[@]} -eq 0 ] && return 0
+    if [ ! -t 0 ]; then
+        echo "Warning: missing resolver file(s) for: ${(j:, :)missing} — those names" >&2
+        echo "resolve via public DNS, not this Mac. Run '$SCRIPT_NAME setup' to restore." >&2
+        return 0
+    fi
+    for name in "${missing[@]}"; do
+        write_resolver_file "$name" || return 1
+    done
+    flush_dns_cache
+}
+
+# Stopping dnsmasq outright would leave the /etc/resolver files routing
+# real-TLD domains to a dead port — macOS never falls back to public DNS
+# when the listed nameserver is down, so a live site like example.com
+# would be unreachable until its resolver file is deleted (sudo). Instead
+# dnsmasq stays up in pass-through mode: no local answers, everything
+# forwarded upstream, no password needed.
 function stop_dns() {
+    if ! dns_configured; then
+        echo "DNS is not configured — run '$SCRIPT_NAME setup'."
+        return 0
+    fi
+    echo "Switching DNS to pass-through mode (real domains resolve normally)..."
+    write_dns_conf passthrough
+    restart_dns
+}
+
+# Full DNS shutdown, explicitly requested via "stop dns". The resolver
+# files stay behind routing their domains to the now-dead port, and macOS
+# won't fall back to public DNS — warn exactly what goes dark.
+function stop_dns_full() {
     if ! dns_configured; then
         echo "DNS is not configured — run '$SCRIPT_NAME setup'."
         return 0
     fi
     echo "Stopping DNS server..."
     brew services stop dnsmasq
+    local name names=()
+    for name in $(list_legacy_tlds); do
+        names+=(".$name (entire TLD)")
+    done
+    for name in $(list_real_domains); do
+        names+=("$name")
+    done
+    [ ${#names[@]} -eq 0 ] && return 0
+    echo ""
+    echo "Warning: with DNS stopped, these domains are unreachable on this Mac —"
+    echo "including their live versions: ${(j:, :)names}"
+    echo "Run '$SCRIPT_NAME start' to serve them locally again, or '$SCRIPT_NAME rm <domain>'"
+    echo "to release a domain back to public DNS."
+}
+
+# macOS caches upstream answers fetched during pass-through with their
+# original TTLs, so a real-TLD site can keep resolving to its production
+# IP for a few minutes after start. Flushing needs sudo, so say how
+# instead of prompting.
+function stale_dns_note() {
+    [ -n "$(list_real_domains)" ] || return 0
+    echo "Note: if a real-TLD site still loads its production version, cached DNS"
+    echo "answers may take a few minutes to expire. To clear them now, run:"
+    echo "  sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"
 }
 
 function restart_dns() {
@@ -180,35 +260,80 @@ function restart_dns() {
 
 # DNS config changes restart dnsmasq at the point of change (ensure_dns_route,
 # setup), so restart doesn't need to bounce it — but if dnsmasq died out
-# from under us (e.g. a brew services reload denied by launchd), revive it.
+# from under us (e.g. a brew services reload denied by launchd), revive it,
+# and if a stop left it in pass-through mode, put it back to serving.
 function ensure_dns_running() {
     dns_configured || return 0
-    is_dnsmasq_running && return 0
-    echo "DNS server is not running — starting it..."
-    brew services start dnsmasq
+    if dns_passthrough; then
+        echo "DNS is in pass-through mode — switching back to serving local sites..."
+        write_dns_conf
+        restart_dns
+        stale_dns_note
+        ensure_resolver_files
+        return 0
+    fi
+    if ! is_dnsmasq_running; then
+        echo "DNS server is not running — starting it..."
+        brew services start dnsmasq
+    fi
+    ensure_resolver_files
 }
 
-# Rewrite the patchy-managed dnsmasq config in full: the .test wildcard
-# always, plus one exact line per real-TLD site. Regeneration is also the
-# teardown path — lines for removed sites (and legacy TLD wildcards) simply
-# aren't re-emitted. Port 53535 is unprivileged, so dnsmasq runs as the
-# user — no sudo, no system daemon.
+# Rewrite the patchy-managed dnsmasq config in full. Serve mode (default):
+# the .test wildcard always, one exact line per real-TLD site, and a
+# TLD-wide wildcard for any lingering legacy /etc/resolver/<tld> file —
+# as long as that file routes the whole TLD here, the conf must answer for
+# it or every lookup under the TLD breaks. Pass-through mode answers
+# nothing locally and forwards upstream via /etc/resolv.conf instead, so
+# the /etc/resolver files (root-owned; deleting them needs sudo) keep
+# pointing at a nameserver that returns real answers while patchy is
+# stopped. Regeneration is also the teardown path — lines for removed
+# sites simply aren't re-emitted. Port 53535 is unprivileged, so dnsmasq
+# runs as the user — no sudo, no system daemon.
 function write_dns_conf() {
+    local mode="${1:-serve}"
     mkdir -p "$DNSMASQ_DIR"
-    local domain
+    local domain tld
     {
         echo "# Managed by Patchy — do not edit."
+        [ "$mode" = "passthrough" ] && echo "# mode: pass-through"
         echo ""
         echo "port=$DNSMASQ_PORT"
         echo "listen-address=127.0.0.1"
         echo "bind-interfaces"
-        echo "no-resolv"
-        echo "address=/.test/127.0.0.1"
-        for domain in $(list_real_domains); do
-            echo "address=/$domain/127.0.0.1"
-        done
+        if [ "$mode" != "passthrough" ]; then
+            echo "no-resolv"
+            echo "address=/.test/127.0.0.1"
+            for tld in $(list_legacy_tlds); do
+                echo "address=/.$tld/127.0.0.1"
+            done
+            for domain in $(list_real_domains); do
+                echo "address=/$domain/127.0.0.1"
+            done
+        fi
     } > "$PATCHY_DNS_CONF"
     echo "Wrote $PATCHY_DNS_CONF"
+}
+
+function dns_passthrough() {
+    grep -qxF "# mode: pass-through" "$PATCHY_DNS_CONF" 2>/dev/null
+}
+
+# Pre-per-domain versions routed whole TLDs via /etc/resolver/<tld>; setup
+# migrates these away, but one whose removal failed (sudo declined) still
+# captures its entire TLD. The resolver dir is the source of truth: a
+# single-label file on our port is a TLD-wide route. (.test is ours by
+# design; .local is cleaned up by setup.)
+function list_legacy_tlds() {
+    local f name
+    for f in "$RESOLVER_DIR"/*(N); do
+        name="${f:t}"
+        case "$name" in
+            test|local|*.*) continue ;;
+        esac
+        resolver_file_ok "$name" && echo "$name"
+    done
+    return 0
 }
 
 # Homebrew's dnsmasq.conf ships with conf-dir commented out; enable it so
@@ -269,11 +394,16 @@ function remove_resolver_file() {
 }
 
 # Once per command, not per domain: rebuild the dnsmasq conf from the
-# surviving sites, bounce dnsmasq, drop stale macOS answers.
+# surviving sites, bounce dnsmasq, drop stale macOS answers. Keeps the
+# current mode so an rm while stopped doesn't flip DNS back to serving.
 function finalize_dns_changes() {
     [ "$DNS_DIRTY" -eq 1 ] || return 0
     DNS_DIRTY=0
-    write_dns_conf
+    if dns_passthrough; then
+        write_dns_conf passthrough
+    else
+        write_dns_conf
+    fi
     restart_dns
     flush_dns_cache
 }
@@ -342,6 +472,14 @@ function domain_routed() {
     resolver_file_ok "$domain" && grep -qF "address=/$domain/" "$PATCHY_DNS_CONF" 2>/dev/null
 }
 
+# add while stopped: the resolver file is written now (so sudo happens at
+# add time, same as always) but the serve conf isn't touched — start
+# regenerates it from the vhost list, picking this domain up.
+function passthrough_route_note() {
+    echo "DNS is in pass-through mode while the server is stopped; the domain"
+    echo "will resolve to this Mac after '$SCRIPT_NAME start'."
+}
+
 # Route a domain's DNS before creating the site. .test rides a TLD-wide
 # wildcard (one resolver file, ever); real TLDs get exact per-domain
 # routing so the rest of the TLD stays on public DNS — a resolver file
@@ -358,6 +496,13 @@ function ensure_dns_route() {
 
     if [ "$tld" = "test" ]; then
         tld_configured "test" && return 0
+        if dns_passthrough; then
+            if ! resolver_file_ok "test"; then
+                write_resolver_file "test" || return 1
+            fi
+            passthrough_route_note
+            return 0
+        fi
         echo "Setting up DNS for .test domains..."
         echo "address=/.test/127.0.0.1" >> "$PATCHY_DNS_CONF"
         if ! write_resolver_file "test"; then
@@ -381,6 +526,14 @@ function ensure_dns_route() {
         y|Y|yes|YES) ;;
         *) echo "Aborted."; return 1 ;;
     esac
+
+    if dns_passthrough; then
+        if ! resolver_file_ok "$domain"; then
+            write_resolver_file "$domain" || return 1
+        fi
+        passthrough_route_note
+        return 0
+    fi
 
     echo "Setting up DNS for $domain..."
     echo "address=/$domain/127.0.0.1" >> "$PATCHY_DNS_CONF"
@@ -449,42 +602,23 @@ function setup_dns() {
 
     echo "Configuring DNS (dnsmasq)..."
 
-    # Pre-per-domain versions wrote TLD-wide wildcards (address=/.com/…);
-    # capture them before write_dns_conf regenerates them away, so their
-    # /etc/resolver/<tld> files can be cleaned up below.
-    local legacy_tlds
-    legacy_tlds=$(sed -n 's|^address=/\.\(.*\)/127\.0\.0\.1$|\1|p' "$PATCHY_DNS_CONF" 2>/dev/null | grep -v -e '^test$' -e '^local$')
-
-    # Remove each legacy TLD-wide resolver file BEFORE the conf is
-    # regenerated below. A TLD whose file can't be removed (sudo declined)
-    # goes in failed_tlds so its wildcard line gets restored after
-    # write_dns_conf — /etc/resolver/<tld> still routes the whole TLD here,
-    # so the conf must keep answering for it or the next dnsmasq restart
-    # (this one, a reboot, a future stop+start) breaks every lookup under
-    # that TLD.
-    local tld failed_tlds=()
-    for tld in ${(f)legacy_tlds}; do
-        if resolver_file_ok "$tld"; then
-            echo "Migrating .$tld from TLD-wide to per-domain routing..."
-            if ! sudo rm -f "$RESOLVER_DIR/$tld"; then
-                failed_tlds+=("$tld")
-                echo "Warning: could not remove $RESOLVER_DIR/$tld — DNS lookups for" >&2
-                echo ".$tld would BREAK if the wildcard were dropped from the dnsmasq" >&2
-                echo "config, so it's being kept for now. Re-run '$SCRIPT_NAME setup' to retry." >&2
-            fi
+    # Migrate pre-per-domain TLD-wide routing: delete each legacy
+    # /etc/resolver/<tld> file. One whose removal fails (sudo declined)
+    # stays in list_legacy_tlds, so write_dns_conf below keeps answering
+    # its wildcard — the conf never falls out of sync with what the
+    # resolver files are actually routing.
+    local tld
+    for tld in $(list_legacy_tlds); do
+        echo "Migrating .$tld from TLD-wide to per-domain routing..."
+        if ! sudo rm -f "$RESOLVER_DIR/$tld"; then
+            echo "Warning: could not remove $RESOLVER_DIR/$tld — DNS lookups for" >&2
+            echo ".$tld would BREAK if the wildcard were dropped from the dnsmasq" >&2
+            echo "config, so it's being kept for now. Re-run '$SCRIPT_NAME setup' to retry." >&2
         fi
     done
 
     ensure_dnsmasq_confdir
     write_dns_conf
-
-    # write_dns_conf unconditionally drops legacy wildcards; put back the
-    # ones still needed (removal above failed) so the conf never falls out
-    # of sync with what /etc/resolver/<tld> is actually routing — even if
-    # setup aborts on the very next line below.
-    for tld in "${failed_tlds[@]}"; do
-        echo "address=/.$tld/127.0.0.1" >> "$PATCHY_DNS_CONF"
-    done
 
     local name
     for name in test $(list_real_domains); do
@@ -896,10 +1030,12 @@ function server_status() {
     fi
     if ! dns_configured; then
         echo "DNS:    Not configured (run '$SCRIPT_NAME setup')"
-    elif is_dnsmasq_running; then
-        echo "DNS:    Running"
-    else
+    elif ! is_dnsmasq_running; then
         echo "DNS:    Stopped"
+    elif dns_passthrough; then
+        echo "DNS:    Pass-through (forwarding upstream; local sites not served)"
+    else
+        echo "DNS:    Running"
     fi
 }
 
@@ -1182,7 +1318,14 @@ case "${1:-}" in
         start_server
         ;;
     stop)
-        stop_server
+        case "${2:-}" in
+            "") stop_server ;;
+            dns) stop_server dns ;;
+            *)
+                echo "Unknown stop option: $2 (did you mean '$SCRIPT_NAME stop dns'?)"
+                exit 1
+                ;;
+        esac
         ;;
     restart)
         restart_server
