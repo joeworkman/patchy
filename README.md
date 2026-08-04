@@ -75,6 +75,20 @@ to flush, no wait. Browsers keep their own DNS caches and connection pools,
 though, so a hard reload (or browser restart) can still help right after
 switching a domain between local and live.
 
+### www alias
+
+Adding an apex domain (`example.com`, `foo.test` — exactly two labels) asks
+`Also serve www.<domain>? [Y/n]`; Enter accepts, `n` declines, and a
+non-interactive `add` (piped from a script) takes the default and serves
+www. Subdomain sites (`shop.example.com`) are never asked. Accepting adds
+its own `/etc/hosts` line and cert SAN alongside the base domain, and
+`rm`/`stop` clean the alias up with the site — nothing extra to manage.
+Existing sites can pick up www by removing and re-adding:
+
+```bash
+patchy rm example.com && patchy add example.com <docroot>
+```
+
 ## Commands
 
 | Command | Description |

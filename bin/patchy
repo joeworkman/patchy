@@ -136,7 +136,7 @@ function stop_server() {
 function sync_hosts_entries() {
     [ -n "$(list_domains)" ] || return 0
     hosts_sudo_note
-    if ! hosts_sync $(list_domains); then
+    if ! hosts_sync $(list_hosts_names); then
         echo "Warning: /etc/hosts was not updated — sites will not resolve locally." >&2
         echo "Run '$SCRIPT_NAME start' again to retry." >&2
         return 1
@@ -241,16 +241,18 @@ function hosts_sync_inline() {
     return $rc
 }
 
-# Sync the configured list ± one domain — used by add/rm, where the vhost
-# file for the domain in question doesn't exist yet / still exists.
+# Sync the configured names ± one site — used by add/rm, where the vhost
+# file for the site in question doesn't exist yet / still exists. add
+# passes the new domain plus any accepted alias explicitly.
 function hosts_add() {
-    hosts_sync $(list_domains) "$1"
+    hosts_sync $(list_hosts_names) "$@"
 }
 
 function hosts_remove() {
-    local domain=$1 d keep=()
-    for d in $(list_domains); do
-        [ "$d" = "$domain" ] || keep+=("$d")
+    local domain=$1 name keep=() drop
+    drop=$(echo "$domain"; list_site_aliases "$domain")
+    for name in $(list_hosts_names); do
+        echo "$drop" | grep -qxF "$name" || keep+=("$name")
     done
     hosts_sync "${keep[@]}"
 }
@@ -379,14 +381,34 @@ function untrust_patchy() {
     echo "Done. /etc/hosts updates will prompt for your password again."
 }
 
+# Offer a www alias on apex adds. Default Yes; non-interactive stdin takes
+# the default so scripted adds don't hang. Prompt goes to stderr because
+# callers capture stdout. The answer is recorded as a ServerAlias — hosts
+# entries, certs, and teardown all derive from that.
+function prompt_www_alias() {
+    local domain=$1 alias reply
+    alias=$(www_alias_for "$domain")
+    [ -n "$alias" ] || return 0
+    if [ -t 0 ]; then
+        printf "Also serve %s? [Y/n] " "$alias" >&2
+        read -r reply
+        case "$reply" in
+            [nN]|[nN][oO]) return 0 ;;
+        esac
+    fi
+    echo "$alias"
+}
+
 # Routing a real domain hides its live site on this Mac — make sure that's
 # intended. .test is fake by definition and .local never leaves the LAN.
 function confirm_real_domain() {
-    local domain=$1
+    local domain=$1 www=${2:-}
     case "${domain##*.}" in
         test|local) return 0 ;;
     esac
-    echo "Routing $domain to this Mac. If $domain is a real website, it will be"
+    local names="$domain"
+    [ -n "$www" ] && names="$domain (and $www)"
+    echo "Routing $names to this Mac. If $domain is a real website, it will be"
     echo "unreachable here until you run '$SCRIPT_NAME rm $domain' or '$SCRIPT_NAME stop'."
     printf "Continue? [y/N] "
     local reply
@@ -461,7 +483,7 @@ function setup_hosts() {
     sudo cp /etc/hosts /etc/hosts.patchy-bkp || return 1
     migrate_dnsmasq
     migrate_hosts_entries || return 1
-    hosts_sync $(list_domains) || return 1
+    hosts_sync $(list_hosts_names) || return 1
 }
 
 function open_in_editor() {
@@ -616,19 +638,24 @@ function add_site() {
 
     echo "Adding a new site... $domain"
 
-    confirm_real_domain "$domain" || return 1
+    local www_alias
+    www_alias=$(prompt_www_alias "$domain")
+
+    confirm_real_domain "$domain" "$www_alias" || return 1
     # Hosts entry first: a declined sudo aborts before anything is created.
     hosts_sudo_note
-    hosts_add "$domain" || return 1
+    hosts_add "$domain" ${www_alias:+"$www_alias"} || return 1
 
     echo "Creating SSL certificates..."
-    make_cert "$domain"
+    make_cert "$domain" ${www_alias:+"$www_alias"}
 
     mkdir -p "$VHOSTS_DIR"
     ensure_sites_included
 
     echo "Creating Apache config file..."
     local conf_file="$VHOSTS_DIR/$domain.conf"
+    local alias_line=""
+    [ -n "$www_alias" ] && alias_line=$'\n'"    ServerAlias $www_alias"
     cat > "$conf_file" <<EOF
 <Directory "$docroot">
     Options Indexes FollowSymLinks
@@ -638,7 +665,7 @@ function add_site() {
 
 <VirtualHost *:80>
     DocumentRoot "$docroot"
-    ServerName $domain
+    ServerName $domain$alias_line
     ErrorLog "$LOG_DIR/$domain-error_log"
     CustomLog "$LOG_DIR/$domain-access_log" common
     RewriteEngine On
@@ -648,7 +675,7 @@ function add_site() {
 
 <VirtualHost *:443>
     DocumentRoot "$docroot"
-    ServerName $domain
+    ServerName $domain$alias_line
     ErrorLog "$LOG_DIR/$domain-error_log"
     CustomLog "$LOG_DIR/$domain-access_log" common
     SSLEngine on
@@ -673,6 +700,9 @@ function root_cert_exists() {
     [ -f "$rootdir/rootCA.pem" ] && [ -f "$rootdir/rootCA-key.pem" ]
 }
 
+# Extra args become SAN names. Filenames are pinned because mkcert's
+# defaults change when a cert has multiple names, and the vhost SSL paths
+# must never move.
 function make_cert() {
     local domain=$1
     mkdir -p "$CERT_DIR"
@@ -680,7 +710,7 @@ function make_cert() {
     if ! root_cert_exists; then
         mkcert -install
     fi
-    mkcert "$domain"
+    mkcert -cert-file "$domain.pem" -key-file "$domain-key.pem" "$@"
 }
 
 function remove_root_certs() {
@@ -704,7 +734,7 @@ function refresh_certs() {
     for site in $(list_domains); do
         [ "$site" = "localhost" ] && continue
         rm -f "$site.pem" "$site-key.pem"
-        make_cert "$site"
+        make_cert "$site" $(list_site_aliases "$site")
     done
 }
 
@@ -724,6 +754,37 @@ function list_domains() {
     for f in "$VHOSTS_DIR"/*.conf(N); do
         echo "${f:t:r}"
     done | sort
+}
+
+# Apex domains (exactly two labels, not already www.) get a www alias
+# offer; subdomain sites never do. Echoes the alias or nothing.
+function www_alias_for() {
+    local domain=$1
+    case "$domain" in
+        www.*) ;;
+        *.*.*) ;;
+        *.*) echo "www.$domain" ;;
+    esac
+    return 0
+}
+
+# ServerAlias values recorded in a site's vhost conf — the durable record
+# of the www answer given at add time. Handles multi-name alias lines.
+function list_site_aliases() {
+    awk '/^[[:space:]]*ServerAlias[[:space:]]/ { for (i = 2; i <= NF; i++) print $i }' \
+        "$VHOSTS_DIR/$1.conf" 2>/dev/null | sort -u
+    return 0
+}
+
+# Every name that must resolve locally: each site plus its aliases. Feeding
+# the hosts sync from here means start/stop/rm need no www-specific code.
+function list_hosts_names() {
+    local domain
+    for domain in $(list_domains); do
+        echo "$domain"
+        list_site_aliases "$domain"
+    done | sort -u
+    return 0
 }
 
 function list_sites() {
@@ -834,18 +895,18 @@ function server_status() {
     else
         echo "Apache: Stopped"
     fi
-    local d domains=($(list_domains)) missing=()
+    local d domains=($(list_hosts_names)) missing=()
     for d in "${domains[@]}"; do
         hosts_entry_exists "$d" || missing+=("$d")
     done
     if [ ${#domains[@]} -eq 0 ]; then
         echo "Hosts:  No sites configured"
     elif [ ${#missing[@]} -eq 0 ]; then
-        echo "Hosts:  Routing ${#domains[@]} site(s) to this Mac"
+        echo "Hosts:  Routing ${#domains[@]} name(s) to this Mac"
     elif [ ${#missing[@]} -eq ${#domains[@]} ]; then
         echo "Hosts:  Not routing (run '$SCRIPT_NAME start' to serve sites locally)"
     else
-        echo "Hosts:  Routing $(( ${#domains[@]} - ${#missing[@]} )) of ${#domains[@]} site(s) — run '$SCRIPT_NAME start' to repair"
+        echo "Hosts:  Routing $(( ${#domains[@]} - ${#missing[@]} )) of ${#domains[@]} name(s) — run '$SCRIPT_NAME start' to repair"
     fi
     if trust_active; then
         echo "Trust:  Passwordless /etc/hosts updates enabled"
