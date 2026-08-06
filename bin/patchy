@@ -115,6 +115,72 @@ function start_server() {
     brew services start httpd
     sync_hosts_entries
     legacy_dns_hint
+    if ! wait_for_apache; then
+        echo "Warning: Apache did not start."
+        diagnose_startup_failure
+        return 1
+    fi
+}
+
+# brew services returns 0 even if launchd fails to bring the process up.
+# Give it a moment and verify.
+function wait_for_apache() {
+    local i
+    for i in 1 2 3; do
+        sleep 1
+        is_apache_running && return 0
+    done
+    return 1
+}
+
+# The httpd LaunchAgent discards stderr, and Apache startup errors raised
+# before the error log is opened (ports already taken, unwritable log dir)
+# only ever go to stderr — so this whole class of failure leaves no trace
+# in 'patchy errors'. Re-run httpd attached to a pipe to surface the real
+# error; if it comes up fine that way, the launchd job itself is wedged.
+function diagnose_startup_failure() {
+    local httpd_bin="$BREW_PREFIX/opt/httpd/bin/httpd"
+    local out pid i
+    if [ ! -x "$httpd_bin" ] || ! out=$(mktemp); then
+        echo "Run '$SCRIPT_NAME errors' to see what went wrong."
+        return 0
+    fi
+    "$httpd_bin" -D FOREGROUND >"$out" 2>&1 &
+    pid=$!
+    for i in 1 2 3; do
+        sleep 1
+        kill -0 "$pid" 2>/dev/null || break
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        # Survived: Apache itself is fine, so the launchd job is stuck
+        # (loaded but dead — bootstrapping it again fails with error 5).
+        # A stop boots the job out; the next start reloads it clean.
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        echo "Apache starts fine when run directly — the launchd service is stuck."
+        echo "Run '$SCRIPT_NAME stop' and then '$SCRIPT_NAME start' to reset it."
+    elif [ -s "$out" ]; then
+        wait "$pid" 2>/dev/null
+        echo "Apache's startup error:"
+        sed 's/^/  /' "$out"
+        if grep -q "Address already in use" "$out"; then
+            # One line per listening process name — prefork spawns dozens of
+            # identical workers and listing them all buries the answer.
+            local holders
+            holders=$(lsof -nP -iTCP:80 -iTCP:443 -sTCP:LISTEN 2>/dev/null | awk 'NR == 1 || !seen[$1]++')
+            if [ -n "$holders" ]; then
+                echo "Something else is listening on port 80/443:"
+                echo "$holders" | sed 's/^/  /'
+            else
+                echo "Run 'sudo lsof -nP -iTCP:80 -iTCP:443 -sTCP:LISTEN' to see"
+                echo "what is holding ports 80/443."
+            fi
+        fi
+    else
+        wait "$pid" 2>/dev/null
+        echo "Run '$SCRIPT_NAME errors' to see what went wrong."
+    fi
+    rm -f "$out"
 }
 
 function stop_server() {
@@ -166,15 +232,9 @@ function restart_server() {
     echo "Restarting Apache server..."
     brew services restart httpd
     sync_hosts_entries
-    # brew services returns 0 even if launchd fails to bring the process up.
-    # Give it a moment and verify.
-    local i
-    for i in 1 2 3; do
-        sleep 1
-        is_apache_running && return 0
-    done
+    wait_for_apache && return 0
     echo "Warning: Apache did not come back up after restart."
-    echo "Run 'patchy errors' to see what went wrong."
+    diagnose_startup_failure
     return 1
 }
 
