@@ -44,6 +44,12 @@ RESOLVER_DIR="/etc/resolver"
 HELPER_PATH="/usr/local/libexec/patchy-hosts"
 SUDOERS_FILE="/etc/sudoers.d/patchy"
 
+# Bumped whenever write_hosts_helper changes what it writes. An installed
+# helper predates the change unless 'check' echoes this exact string, and a
+# stale helper would keep writing the old entries while patchy assumed the
+# new ones — so a mismatch falls back to inline sudo until 'trust' reinstalls.
+HELPER_VERSION="2"
+
 # Script name for help text (zsh's $0 resolves to function name inside functions)
 SCRIPT_NAME="${0:t}"
 
@@ -251,9 +257,17 @@ function flush_dns_cache() {
 # marker, so patchy can rewrite its own entries without touching anything
 # else. (.local names are Bonjour-safe here — exact hosts entries don't
 # capture the TLD the way a resolver file would.)
+#
+# Both an IPv4 and an IPv6 line, always. Browsers resolve with AF_UNSPEC and
+# wait for the A *and* AAAA answers before connecting. A .local name with only
+# a 127.0.0.1 line answers the A leg from here but leaves the AAAA leg to
+# mDNSResponder, which multicasts it to the LAN and waits out the full 5s
+# Bonjour timeout — a flat 5s added to every request. The ::1 line answers
+# that leg locally so it never reaches multicast.
 function hosts_entry_exists() {
     local escaped="${1//./\\.}"
-    grep -qE "^127\.0\.0\.1[[:space:]]+${escaped}[[:space:]]*# patchy\$" /etc/hosts
+    grep -qE "^127\.0\.0\.1[[:space:]]+${escaped}[[:space:]]*# patchy\$" /etc/hosts &&
+        grep -qE "^::1[[:space:]]+${escaped}[[:space:]]*# patchy\$" /etc/hosts
 }
 
 function hosts_active() {
@@ -263,11 +277,23 @@ function hosts_active() {
 # Passwordless mode is usable only if the helper exists AND sudo lets us run
 # it without a password ('patchy trust' installs both).
 function trust_active() {
+    [ -x "$HELPER_PATH" ] || return 1
+    [ "$(sudo -n "$HELPER_PATH" check 2>/dev/null)" = "$HELPER_VERSION" ]
+}
+
+# Installed and callable, but not necessarily the current version. Used to
+# tell "never trusted" apart from "trusted, but the helper needs updating".
+function trust_installed() {
     [ -x "$HELPER_PATH" ] && sudo -n "$HELPER_PATH" check >/dev/null 2>&1
 }
 
 function hosts_sudo_note() {
     trust_active && return 0
+    if trust_installed; then
+        echo "Password prompt ahead: the patchy-hosts helper is out of date."
+        echo "Run '$SCRIPT_NAME trust' once to update it and stop these prompts."
+        return 0
+    fi
     echo "Password prompt ahead: patchy routes domains via /etc/hosts, which needs"
     echo "sudo. Run '$SCRIPT_NAME trust' once to stop these prompts."
 }
@@ -293,6 +319,7 @@ function hosts_sync_inline() {
         grep -v '# patchy$' /etc/hosts
         for domain in "$@"; do
             echo "127.0.0.1 $domain # patchy"
+            echo "::1 $domain # patchy"
         done
     } > "$tmp" || { rm -f "$tmp"; return 1; }
     sudo /usr/bin/install -m 644 -o root -g wheel "$tmp" /etc/hosts
@@ -321,16 +348,20 @@ function hosts_remove() {
 # root-owned, and impossible to talk into editing anything but our marked
 # lines. Emitted here so patchy stays a single distributable file.
 function write_hosts_helper() {
+    # Shebang and version printed separately so HELPER_VERSION interpolates;
+    # the body stays in a quoted heredoc so its own $vars reach the helper
+    # verbatim rather than being expanded here.
+    printf '#!/bin/sh\n'
+    printf "# patchy-hosts — installed root-owned by 'patchy trust'.\n"
+    printf '# Rewrites the "# patchy" marked lines of /etc/hosts and nothing else.\n'
+    printf 'PATCHY_HELPER_VERSION=%s\n' "$HELPER_VERSION"
     cat <<'EOF'
-#!/bin/sh
-# patchy-hosts — installed root-owned by 'patchy trust'.
-# Rewrites the "# patchy" marked lines of /etc/hosts and nothing else.
 set -eu
 
 [ "$(id -u)" -eq 0 ] || { echo "patchy-hosts must run as root (via sudo)" >&2; exit 1; }
 
 case "${1:-}" in
-    check) exit 0 ;;
+    check) echo "$PATCHY_HELPER_VERSION"; exit 0 ;;
     sync) shift ;;
     *) echo "usage: patchy-hosts sync [domain ...]" >&2; exit 64 ;;
 esac
@@ -351,6 +382,7 @@ trap 'rm -f "$tmp"' EXIT
 grep -v '# patchy$' /etc/hosts > "$tmp" || true
 for domain in "$@"; do
     printf '127.0.0.1 %s # patchy\n' "$domain" >> "$tmp"
+    printf '::1 %s # patchy\n' "$domain" >> "$tmp"
 done
 chmod 644 "$tmp"
 chown root:wheel "$tmp"
@@ -970,6 +1002,8 @@ function server_status() {
     fi
     if trust_active; then
         echo "Trust:  Passwordless /etc/hosts updates enabled"
+    elif trust_installed; then
+        echo "Trust:  Helper is out of date — run '$SCRIPT_NAME trust' to update it"
     fi
 }
 
