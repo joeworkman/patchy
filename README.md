@@ -89,12 +89,35 @@ Existing sites can pick up www by removing and re-adding:
 patchy rm example.com && patchy add example.com <docroot>
 ```
 
+## Sharing a site
+
+`patchy share <domain>` gives a site a temporary public link through a free
+[Cloudflare quick tunnel](https://try.cloudflare.com) — handy for showing a
+client a preview without deploying. It needs `cloudflared`
+(`brew install cloudflared`) and no Cloudflare account.
+
+```bash
+patchy share example.test
+# Requesting a public link for example.test...
+# Sharing example.test at https://quiet-river-banana.trycloudflare.com
+# Anyone with this link can see the site. Press Ctrl-C to stop sharing.
+```
+
+The link works while the command runs; Ctrl-C ends it. Anyone with the link
+can see the site. cloudflared verifies the site's mkcert certificate against
+mkcert's root CA rather than skipping the TLS check to Apache.
+
+The site's PHP still sees its local domain as the host. Plain PHP and static
+sites work as-is; apps with a fixed site URL (WordPress's `siteurl`/`home`,
+for example) may redirect visitors to `example.test`, which they can't reach.
+
 ## Commands
 
 | Command | Description |
 |---|---|
 | `patchy add <domain> [dir]` | Add a new site. Docroot defaults to `~/Websites/<domain>`. |
 | `patchy rm <domain>...` | Remove one or more sites. |
+| `patchy share <domain>` | Share a site at a temporary public `trycloudflare.com` link until Ctrl-C. Needs `cloudflared`. |
 | `patchy list` | List configured sites. |
 | `patchy start` / `stop` | Start/stop Apache. `start` routes every configured site to this Mac via `/etc/hosts`; `stop` releases those entries, so real domains resolve normally again immediately. |
 | `patchy restart` | Restart Apache and repair `/etc/hosts` routing if any entries went missing. |
@@ -156,6 +179,7 @@ If your stack targets Nginx + FPM, Valet or Herd will probably serve you better.
 - [Homebrew](https://brew.sh)
 - `sudo` access — needed to edit `/etc/hosts` during `patchy setup`, `start`, `stop`, `add`, and `rm`, unless you run `patchy trust` once (see below)
 - `zsh` (the default shell on modern macOS)
+- `cloudflared`, only for `patchy share` (`brew install cloudflared`)
 
 > **Note:** Apache binds ports 80/443 with a wildcard bind, which needs no root on modern macOS but is reachable from your local network (handy for testing from a phone). The macOS firewall may ask once to allow `httpd`.
 
