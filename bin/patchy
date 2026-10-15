@@ -719,6 +719,32 @@ function share_quick() {
 function share_site() {
     local domain=$1
     shift
+    local quick=0 name="" protect="" new_password=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --quick) quick=1 ;;
+            --name)
+                name=${2:-}
+                if [ -z "$name" ]; then
+                    echo "Please provide a name after --name."
+                    return 1
+                fi
+                shift
+                ;;
+            --open) protect=open ;;
+            --password) protect=password ;;
+            --new-password) new_password=1 ;;
+            *)
+                echo "Unknown option: $1"
+                return 1
+                ;;
+        esac
+        shift
+    done
+    if [ "$quick" -eq 1 ] && { [ -n "$name" ] || [ -n "$protect" ] || [ "$new_password" -eq 1 ]; }; then
+        echo "--quick can't be combined with other options."
+        return 1
+    fi
 
     if ! site_exists "$domain"; then
         echo "Site does not exist... $domain"
@@ -733,11 +759,28 @@ function share_site() {
         return 1
     fi
 
-    if ! share_ready; then
+    if [ "$quick" -eq 1 ] || ! share_ready; then
+        if [ -n "$name" ] || [ -n "$protect" ] || [ "$new_password" -eq 1 ]; then
+            echo "Set up your own domain first: $SCRIPT_NAME share setup <domain>"
+            return 1
+        fi
         share_quick "$domain"
         return
     fi
-    share_prepare "$domain" "" || return 1
+
+    share_prepare "$domain" "$name" || return 1
+    local dir="$SHARE_DIR/sites/$domain" changed=0
+    case $protect in
+        open) [ -f "$dir/open" ] || { touch "$dir/open"; changed=1; } ;;
+        password) [ -f "$dir/open" ] && { rm -f "$dir/open"; changed=1; } ;;
+    esac
+    if [ "$new_password" -eq 1 ]; then
+        set_share_password "$domain" "$(make_share_password)"
+        changed=1
+    fi
+    if [ "$changed" -eq 1 ]; then
+        apply_share_vhost "$domain" || return 1
+    fi
     share_stable "$domain"
 }
 
@@ -1015,12 +1058,79 @@ function share_prepare() {
     fi
 }
 
+
+# Run a site's own tunnel until interrupted. A tunnel deleted in the
+# dashboard is recreated once, for the site's own recorded address.
 function share_stable() {
-    local domain=$1 dir="$SHARE_DIR/sites/$1"
-    run_share_tunnel "$domain" "https://$(<"$dir/name").$(share_domain)" \
-        "Username: $SHARE_USER   Password: $(<"$dir/password")"$'\n'"Anyone with the address and password can see the site. Press Ctrl-C to stop sharing." \
-        cloudflared tunnel --no-autoupdate --origincert "$SHARE_DIR/cert.pem" --config "$dir/tunnel.yml" run
-    [ "$?" -eq 0 ]
+    local domain=$1 dir="$SHARE_DIR/sites/$1" address notice
+    address="https://$(<"$dir/name").$(share_domain)"
+    if [ -f "$dir/open" ]; then
+        notice="Anyone with the address can see the site. Press Ctrl-C to stop sharing."
+    else
+        notice="Username: $SHARE_USER   Password: $(<"$dir/password")"$'\n'"Anyone with the address and password can see the site. Press Ctrl-C to stop sharing."
+    fi
+    local attempt result
+    for attempt in 1 2; do
+        run_share_tunnel "$domain" "$address" "$notice" \
+            cloudflared tunnel --no-autoupdate --origincert "$SHARE_DIR/cert.pem" --config "$dir/tunnel.yml" run
+        result=$?
+        [ "$result" -ne 2 ] && return $result
+        if [ "$attempt" -eq 1 ] && grep -q 'Tunnel not found' <<<"$SHARE_LOG"; then
+            echo "The tunnel for $domain was deleted on Cloudflare. Creating it again..."
+            share_recreate "$domain" || return 1
+            continue
+        fi
+        break
+    done
+    if grep -qiE 'origin cert|unauthori[sz]ed|authentication' <<<"$SHARE_LOG"; then
+        echo "Your Cloudflare login has expired. Run '$SCRIPT_NAME share setup $(share_domain)' again."
+    else
+        echo "cloudflared stopped before the link was ready:"
+        tail -n 10 <<<"$SHARE_LOG"
+    fi
+    return 1
+}
+
+# Move a site to a new stable name on the same tunnel. The old record stays.
+function share_rename() {
+    local domain=$1 want=$2 dir="$SHARE_DIR/sites/$1" old host log
+    if ! valid_share_name "$want"; then
+        echo "\"$want\" can't be used in a web address. Use lowercase letters, numbers and hyphens."
+        return 1
+    fi
+    old="$(<"$dir/name").$(share_domain)"
+    host="$want.$(share_domain)"
+    log=$(mktemp -t patchy-share-route) || return 1
+    if ! share_route "$(<"$dir/tunnel")" "$host" "$log"; then
+        rm -f "$log"
+        return 1
+    fi
+    rm -f "$log"
+    echo "$want" > "$dir/name"
+    write_tunnel_config "$domain"
+    apply_share_vhost "$domain" || return 1
+    echo "$old still has a DNS record on Cloudflare. Delete it in the Cloudflare dashboard (DNS) if you don't need it."
+}
+
+# Recreate a site's tunnel after it was deleted in the dashboard, and point
+# the site's own recorded address at it (the only overwrite Patchy makes).
+function share_recreate() {
+    local domain=$1 dir="$SHARE_DIR/sites/$1" tunnel host log
+    tunnel=$(<"$dir/tunnel")
+    host="$(<"$dir/name").$(share_domain)"
+    log=$(mktemp -t patchy-share-route) || return 1
+    cf_tunnel delete -f "$tunnel" >/dev/null 2>&1
+    rm -f "$dir/tunnel.json"
+    if ! cf_tunnel create --credentials-file "$dir/tunnel.json" "$tunnel" >"$log" 2>&1 \
+        || ! cf_tunnel route dns --overwrite-dns "$tunnel" "$host" >>"$log" 2>&1; then
+        echo "Couldn't create the tunnel again:"
+        tail -n 5 "$log"
+        rm -f "$log"
+        return 1
+    fi
+    rm -f "$log"
+    chmod 600 "$dir/tunnel.json"
+    write_tunnel_config "$domain"
 }
 
 # Line number of the first ACTIVE (uncommented) line containing the needle
