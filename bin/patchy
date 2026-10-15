@@ -95,7 +95,12 @@ Commands:
   list                List the sites configured on the Apache server
   add <domain> [dir]  Add a new site (docroot defaults to ~/Websites/<domain>)
   rm <domain>...      Remove one or more sites with the specified domains
-  share <domain>      Share a site at a temporary public link (needs cloudflared)
+  share <domain>      Share a site at a public link (needs cloudflared): your own
+                      domain once set up, otherwise a temporary link.
+                      Options: --quick, --name <word>, --open, --password, --new-password
+  share setup <domain>
+                      Use your own Cloudflare domain for stable share addresses
+  share reset         Stop using your own domain; back to temporary links
 
   status              Display the status of the Apache server and /etc/hosts routing
   start               Start Apache and route site domains to this Mac (/etc/hosts)
@@ -907,7 +912,8 @@ function share_default_name() {
 
 # One DNS label: Cloudflare's free certificates cover one level under the domain.
 function valid_share_name() {
-    [[ $1 =~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$' ]]
+    local label='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+    [[ $1 =~ $label ]]
 }
 
 # 12 characters in groups of 4, without look-alikes (0/O, 1/l/I), to read out to a client.
@@ -1026,7 +1032,8 @@ function share_prepare() {
         echo "\"$name\" can't be used in a web address. Use lowercase letters, numbers and hyphens."
         return 1
     fi
-    local host="$name.$(share_domain)" tunnel="patchy-$name" tmp
+    local host tunnel="patchy-$name" tmp
+    host="$name.$(share_domain)"
     echo "Setting up $host (first share only)..."
     tmp=$(mktemp -d -t patchy-share-site) || return 1
     if ! cf_tunnel create --credentials-file "$tmp/tunnel.json" "$tunnel" >"$tmp/log" 2>&1; then
@@ -1441,6 +1448,17 @@ function list_sites() {
         # color applied outside the padding so escape codes don't skew column width
         printf "%-${dwidth}s ${color}%-8s${reset} %s\n" "$domain" "$https" "$docroot"
     done < <(list_domains)
+    if share_ready; then
+        local share first=1
+        for share in "$SHARE_DIR"/sites/*(N/); do
+            if [ "$first" -eq 1 ]; then
+                echo ""
+                echo "Share addresses:"
+                first=0
+            fi
+            printf "%-${dwidth}s https://%s.%s\n" "${share:t}" "$(<"$share/name")" "$(share_domain)"
+        done
+    fi
     if [ "$needs_attention" -eq 1 ]; then
         echo ""
         echo "Some certificates expire soon or are invalid. Run 'patchy refresh-certs' to regenerate them."
@@ -1462,6 +1480,7 @@ function remove_site() {
 
     remove_domain "$domain" || return 1
     remove_cert "$domain"
+    share_forget_site "$domain"
 }
 
 # Hosts teardown runs FIRST: a declined sudo leaves the site fully intact

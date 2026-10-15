@@ -111,13 +111,49 @@ The site's PHP still sees its local domain as the host. Plain PHP and static
 sites work as-is; apps with a fixed site URL (WordPress's `siteurl`/`home`,
 for example) may redirect visitors to `example.test`, which they can't reach.
 
+### Stable addresses on your own domain
+
+If you have a domain on Cloudflare, each site can get a stable address a
+client can bookmark, like `harbor.example.com`, instead of a new random one
+every time:
+
+```bash
+patchy share setup example.com   # once: approve example.com in the browser
+patchy share harbor.test
+# Setting up harbor.example.com (first share only)...
+# Sharing harbor.test at https://harbor.example.com
+# Username: preview   Password: k7Rm-4vQx-92Ld
+```
+
+Nothing is reachable until you share a site, and only while the command
+runs. Each site gets its own Cloudflare tunnel and DNS record the first time
+it's shared, and a password unless you share it with `--open`. Patchy never
+replaces an existing DNS record, so your live subdomains are safe.
+
+| Option | |
+|---|---|
+| `--name <word>` | Use `<word>.example.com` (default: the local name, dots as hyphens). |
+| `--open` / `--password` | Share without / with a password. Remembered per site. |
+| `--new-password` | Make a new password. |
+| `--quick` | A temporary `trycloudflare.com` link this time. |
+
+Addresses are one level deep (`harbor.example.com`, not
+`harbor.preview.example.com`) because Cloudflare's free certificates only
+cover one level. `patchy rm` deletes a site's tunnel, but cloudflared can't
+delete DNS records, so Patchy tells you which ones to remove in the
+Cloudflare dashboard. `patchy share reset` disconnects the domain.
+
+Patchy keeps its Cloudflare login in its own folder
+(`$(brew --prefix)/etc/httpd/share`), not `~/.cloudflared`, so your own
+cloudflared setup and quick links keep working.
+
 ## Commands
 
 | Command | Description |
 |---|---|
 | `patchy add <domain> [dir]` | Add a new site. Docroot defaults to `~/Websites/<domain>`. |
 | `patchy rm <domain>...` | Remove one or more sites. |
-| `patchy share <domain>` | Share a site at a temporary public `trycloudflare.com` link until Ctrl-C. Needs `cloudflared`. |
+| `patchy share <domain>` | Share a site at a public link until Ctrl-C: a temporary `trycloudflare.com` link, or a stable address on your own domain after `patchy share setup`. Needs `cloudflared`. |
 | `patchy list` | List configured sites. |
 | `patchy start` / `stop` | Start/stop Apache. `start` routes every configured site to this Mac via `/etc/hosts`; `stop` releases those entries, so real domains resolve normally again immediately. |
 | `patchy restart` | Restart Apache and repair `/etc/hosts` routing if any entries went missing. |
