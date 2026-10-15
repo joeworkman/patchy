@@ -91,6 +91,7 @@ Commands:
   list                List the sites configured on the Apache server
   add <domain> [dir]  Add a new site (docroot defaults to ~/Websites/<domain>)
   rm <domain>...      Remove one or more sites with the specified domains
+  share <domain>      Share a site at a temporary public link (needs cloudflared)
 
   status              Display the status of the Apache server and /etc/hosts routing
   start               Start Apache and route site domains to this Mac (/etc/hosts)
@@ -617,6 +618,83 @@ function errors() {
     else
         tail -n "$arg" "$log"
     fi
+}
+
+# The quick tunnel's public link, as cloudflared logs it. Its log also
+# mentions the API host, which is not the link.
+function share_url_in() {
+    grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$1" | grep -v '^https://api\.' | head -n 1
+}
+
+# Serve one site at a temporary public link (a Cloudflare quick tunnel) until
+# interrupted. cloudflared sends the site's name so Apache picks its vhost,
+# and checks the site's mkcert cert against mkcert's root CA.
+function share_site() {
+    local domain=$1
+
+    if ! site_exists "$domain"; then
+        echo "Site does not exist... $domain"
+        return 1
+    fi
+    if ! is_apache_running; then
+        echo "Apache isn't running. Start it with: patchy start"
+        return 1
+    fi
+    if ! command -v cloudflared >/dev/null 2>&1; then
+        echo "cloudflared is required: brew install cloudflared"
+        return 1
+    fi
+
+    local log
+    log=$(mktemp -t patchy-share) || return 1
+
+    echo "Requesting a public link for $domain..."
+
+    # A GUI may signal only this process, so cloudflared is stopped explicitly.
+    # The trap is set before launch so an early signal can't orphan it.
+    local pid="" stopping=0
+    trap 'stopping=1; [ -n "$pid" ] && kill -TERM $pid 2>/dev/null' INT TERM HUP
+
+    cloudflared tunnel --no-autoupdate \
+        --url https://localhost:443 \
+        --http-host-header "$domain" \
+        --origin-server-name "$domain" \
+        --origin-ca-pool "$(mkcert -CAROOT)/rootCA.pem" \
+        >"$log" 2>&1 &
+    pid=$!
+    [ "$stopping" -eq 1 ] && kill -TERM "$pid" 2>/dev/null
+
+    local url=""
+    while [ -z "$url" ] && [ "$stopping" -eq 0 ] && kill -0 "$pid" 2>/dev/null; do
+        url=$(share_url_in "$log")
+        [ -z "$url" ] && sleep 0.2
+    done
+
+    if [ -n "$url" ] && [ "$stopping" -eq 0 ]; then
+        echo "Sharing $domain at $url"
+        echo "Anyone with this link can see the site. Press Ctrl-C to stop sharing."
+    fi
+
+    # A trapped signal ends wait early, so keep waiting until cloudflared is gone.
+    while kill -0 "$pid" 2>/dev/null; do
+        wait "$pid" 2>/dev/null
+    done
+    trap - INT TERM HUP
+
+    local result=0
+    if [ "$stopping" -eq 1 ]; then
+        echo "Stopped sharing $domain."
+    elif [ -z "$url" ]; then
+        echo "cloudflared stopped before the link was ready:"
+        tail -n 10 "$log"
+        result=1
+    else
+        echo "The link stopped working because cloudflared quit:"
+        tail -n 10 "$log"
+        result=1
+    fi
+    rm -f "$log"
+    return $result
 }
 
 # Line number of the first ACTIVE (uncommented) line containing the needle
@@ -1344,6 +1422,13 @@ case "${1:-}" in
         if [ "$removed" -eq 1 ]; then
             restart_server
         fi
+        ;;
+    share)
+        if [ -z "${2:-}" ]; then
+            echo "Please provide a domain."
+            exit 1
+        fi
+        share_site "$2"
         ;;
     errors)
         errors "${2:-20}"
