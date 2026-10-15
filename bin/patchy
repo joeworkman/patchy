@@ -28,6 +28,10 @@ export PATCHY_CONF
 LOG_DIR="$BREW_PREFIX/var/log/httpd"
 export LOG_DIR
 
+# Stable share addresses (patchy share setup): Cloudflare login, domain, per-site tunnels
+SHARE_DIR="$BREW_PREFIX/etc/httpd/share"
+SHARE_USER="preview"
+
 # Default parent directory for new site docroots
 DEFAULT_WEBROOT="$HOME/Websites"
 
@@ -626,27 +630,17 @@ function share_url_in() {
     grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$1" | grep -v '^https://api\.' | head -n 1
 }
 
-# Serve one site at a temporary public link (a Cloudflare quick tunnel) until
-# interrupted. cloudflared sends the site's name so Apache picks its vhost,
-# and checks the site's mkcert cert against mkcert's root CA.
-function share_site() {
-    local domain=$1
-
-    if ! site_exists "$domain"; then
-        echo "Site does not exist... $domain"
-        return 1
-    fi
-    if ! is_apache_running; then
-        echo "Apache isn't running. Start it with: patchy start"
-        return 1
-    fi
-    if ! command -v cloudflared >/dev/null 2>&1; then
-        echo "cloudflared is required: brew install cloudflared"
-        return 1
-    fi
-
+# Starts a share's cloudflared in the background and waits until interrupted.
+# A stable share knows its address up front and is ready once cloudflared
+# registers a connection; a quick tunnel's address is read from its log.
+# Returns 0 when stopped by a signal, 1 if the tunnel quit after it was ready,
+# 2 if it quit (or was given up on) before; SHARE_LOG then holds its log.
+function run_share_tunnel() {
+    local domain=$1 address=$2 notice=$3
+    shift 3
+    SHARE_LOG=""
     local log
-    log=$(mktemp -t patchy-share) || return 1
+    log=$(mktemp -t patchy-share) || return 2
 
     echo "Requesting a public link for $domain..."
 
@@ -655,24 +649,29 @@ function share_site() {
     local pid="" stopping=0
     trap 'stopping=1; [ -n "$pid" ] && kill -TERM $pid 2>/dev/null' INT TERM HUP
 
-    cloudflared tunnel --no-autoupdate \
-        --url https://localhost:443 \
-        --http-host-header "$domain" \
-        --origin-server-name "$domain" \
-        --origin-ca-pool "$(mkcert -CAROOT)/rootCA.pem" \
-        >"$log" 2>&1 &
+    "$@" >"$log" 2>&1 &
     pid=$!
     [ "$stopping" -eq 1 ] && kill -TERM "$pid" 2>/dev/null
 
     local url=""
     while [ -z "$url" ] && [ "$stopping" -eq 0 ] && kill -0 "$pid" 2>/dev/null; do
-        url=$(share_url_in "$log")
+        if [ -n "$address" ]; then
+            if grep -q 'Registered tunnel connection' "$log"; then
+                url=$address
+            elif grep -q 'Tunnel not found' "$log"; then
+                # A deleted tunnel never exits on its own; cloudflared just retries.
+                kill -TERM "$pid" 2>/dev/null
+                break
+            fi
+        else
+            url=$(share_url_in "$log")
+        fi
         [ -z "$url" ] && sleep 0.2
     done
 
     if [ -n "$url" ] && [ "$stopping" -eq 0 ]; then
         echo "Sharing $domain at $url"
-        echo "Anyone with this link can see the site. Press Ctrl-C to stop sharing."
+        echo "$notice"
     fi
 
     # A trapped signal ends wait early, so keep waiting until cloudflared is gone.
@@ -685,16 +684,161 @@ function share_site() {
     if [ "$stopping" -eq 1 ]; then
         echo "Stopped sharing $domain."
     elif [ -z "$url" ]; then
-        echo "cloudflared stopped before the link was ready:"
-        tail -n 10 "$log"
-        result=1
+        result=2
     else
         echo "The link stopped working because cloudflared quit:"
         tail -n 10 "$log"
         result=1
     fi
+    SHARE_LOG=$(<"$log")
     rm -f "$log"
     return $result
+}
+
+# Serve one site at a temporary trycloudflare.com link. cloudflared sends the
+# site's name so Apache picks its vhost, and checks the site's mkcert cert
+# against mkcert's root CA.
+function share_quick() {
+    local domain=$1
+    run_share_tunnel "$domain" "" "Anyone with this link can see the site. Press Ctrl-C to stop sharing." \
+        cloudflared tunnel --no-autoupdate \
+            --url https://localhost:443 \
+            --http-host-header "$domain" \
+            --origin-server-name "$domain" \
+            --origin-ca-pool "$(mkcert -CAROOT)/rootCA.pem"
+    local result=$?
+    if [ "$result" -eq 2 ]; then
+        echo "cloudflared stopped before the link was ready:"
+        tail -n 10 <<<"$SHARE_LOG"
+        return 1
+    fi
+    return $result
+}
+
+# The checks every share needs, then a stable or quick share.
+function share_site() {
+    local domain=$1
+    shift
+
+    if ! site_exists "$domain"; then
+        echo "Site does not exist... $domain"
+        return 1
+    fi
+    if ! is_apache_running; then
+        echo "Apache isn't running. Start it with: $SCRIPT_NAME start"
+        return 1
+    fi
+    if ! command -v cloudflared >/dev/null 2>&1; then
+        echo "cloudflared is required: brew install cloudflared"
+        return 1
+    fi
+
+    share_quick "$domain"
+}
+
+function share_domain() {
+    cat "$SHARE_DIR/domain" 2>/dev/null
+}
+
+# True once 'patchy share setup' has connected a domain.
+function share_ready() {
+    [ -s "$SHARE_DIR/cert.pem" ] && [ -s "$SHARE_DIR/domain" ]
+}
+
+# cloudflared's tunnel commands, using Patchy's login rather than ~/.cloudflared.
+function cf_tunnel() {
+    cloudflared tunnel --origincert "$SHARE_DIR/cert.pem" "$@"
+}
+
+# The domain a Cloudflare login approved. The login cert holds a token with
+# the zone's ID and an API token that can read the zone's name.
+function cert_zone_name() {
+    local token zone_id api_token
+    token=$(sed -n '/BEGIN ARGO TUNNEL TOKEN/,/END ARGO TUNNEL TOKEN/{/-----/d;p;}' "$1" | tr -d '\n' | base64 --decode 2>/dev/null) || return 1
+    zone_id=$(jq -r '.zoneID // empty' <<<"$token" 2>/dev/null)
+    api_token=$(jq -r '.apiToken // empty' <<<"$token" 2>/dev/null)
+    [ -n "$zone_id" ] && [ -n "$api_token" ] || return 1
+    curl -fsS -H "Authorization: Bearer $api_token" \
+        "https://api.cloudflare.com/client/v4/zones/$zone_id" 2>/dev/null | jq -r '.result.name // empty'
+}
+
+# Connect a Cloudflare domain for stable share addresses. cloudflared's login
+# always writes ~/.cloudflared/cert.pem, so any existing one is set aside and
+# put back, and the new one moves to Patchy's folder.
+function share_setup() {
+    local domain=${1:-}
+    if [ -z "$domain" ]; then
+        echo "Please provide your domain, e.g. $SCRIPT_NAME share setup example.com"
+        return 1
+    fi
+    if ! command -v cloudflared >/dev/null 2>&1; then
+        echo "cloudflared is required: brew install cloudflared"
+        return 1
+    fi
+
+    local cf_dir="$HOME/.cloudflared" saved=""
+    mkdir -p "$cf_dir"
+    if [ -f "$cf_dir/cert.pem" ]; then
+        saved=$(mktemp -t patchy-cert) && mv "$cf_dir/cert.pem" "$saved"
+    fi
+
+    echo "Opening Cloudflare in your browser. Choose $domain and click Authorize..."
+    local interrupted=0 approved=""
+    trap 'interrupted=1' INT TERM HUP
+    if cloudflared tunnel login && [ "$interrupted" -eq 0 ] && [ -f "$cf_dir/cert.pem" ]; then
+        approved=$(cert_zone_name "$cf_dir/cert.pem")
+    fi
+    trap - INT TERM HUP
+
+    local result=1
+    if [ "$interrupted" -eq 1 ] || [ ! -f "$cf_dir/cert.pem" ]; then
+        echo "No domain was connected. $SCRIPT_NAME share will keep giving temporary links."
+    elif [ "$approved" != "$domain" ]; then
+        if [ -n "$approved" ]; then
+            echo "You approved $approved in the browser, not $domain. Run '$SCRIPT_NAME share setup $domain' again and choose $domain."
+        else
+            echo "Couldn't check which domain Cloudflare approved, so nothing was changed."
+        fi
+    else
+        if share_ready && [ "$(share_domain)" != "$domain" ]; then
+            echo "Switching from $(share_domain) to $domain..."
+            share_forget_all
+        fi
+        mkdir -p "$SHARE_DIR" && chmod 700 "$SHARE_DIR"
+        mv "$cf_dir/cert.pem" "$SHARE_DIR/cert.pem" && chmod 600 "$SHARE_DIR/cert.pem"
+        echo "$domain" > "$SHARE_DIR/domain"
+        echo "Connected. $SCRIPT_NAME share will now give each site an address on $domain."
+        result=0
+    fi
+    rm -f "$cf_dir/cert.pem"
+    [ -n "$saved" ] && mv "$saved" "$cf_dir/cert.pem"
+    return $result
+}
+
+# Forget every site's stable address (tunnels deleted, DNS records reported).
+function share_forget_all() {
+    local dir
+    for dir in "$SHARE_DIR"/sites/*(N/); do
+        share_forget_site "${dir:t}"
+    done
+    rm -rf "$SHARE_DIR/vhosts"
+}
+
+function share_reset() {
+    if ! share_ready; then
+        echo "No sharing domain is set up. $SCRIPT_NAME share gives temporary links."
+        return 0
+    fi
+    local domain
+    domain=$(share_domain)
+    share_forget_all
+    rm -rf "$SHARE_DIR"
+    is_apache_running && apachectl -k graceful >/dev/null 2>&1
+    echo "Disconnected $domain. $SCRIPT_NAME share will give temporary links again."
+}
+
+function share_forget_site() {
+    rm -rf "$SHARE_DIR/sites/$1" "$SHARE_DIR/vhosts/$1.conf"
 }
 
 # Line number of the first ACTIVE (uncommented) line containing the needle
@@ -1089,6 +1233,11 @@ function server_status() {
     elif trust_installed; then
         echo "Trust:  Helper is out of date — run '$SCRIPT_NAME trust' to update it"
     fi
+    if share_ready; then
+        echo "Share:  Addresses on $(share_domain)"
+    else
+        echo "Share:  Temporary links (run '$SCRIPT_NAME share setup <domain>' to use your own)"
+    fi
 }
 
 function server_info() {
@@ -1424,11 +1573,22 @@ case "${1:-}" in
         fi
         ;;
     share)
-        if [ -z "${2:-}" ]; then
-            echo "Please provide a domain."
-            exit 1
-        fi
-        share_site "$2"
+        case "${2:-}" in
+            "")
+                echo "Please provide a domain."
+                exit 1
+                ;;
+            setup)
+                share_setup "${3:-}"
+                ;;
+            reset)
+                share_reset
+                ;;
+            *)
+                shift
+                share_site "$@"
+                ;;
+        esac
         ;;
     errors)
         errors "${2:-20}"
