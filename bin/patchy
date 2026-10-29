@@ -28,6 +28,10 @@ export PATCHY_CONF
 LOG_DIR="$BREW_PREFIX/var/log/httpd"
 export LOG_DIR
 
+# Stable share addresses (patchy share setup): Cloudflare login, domain, per-site tunnels
+SHARE_DIR="$BREW_PREFIX/etc/httpd/share"
+SHARE_USER="preview"
+
 # Default parent directory for new site docroots
 DEFAULT_WEBROOT="$HOME/Websites"
 
@@ -91,6 +95,12 @@ Commands:
   list                List the sites configured on the Apache server
   add <domain> [dir]  Add a new site (docroot defaults to ~/Websites/<domain>)
   rm <domain>...      Remove one or more sites with the specified domains
+  share <domain>      Share a site at a public link (needs cloudflared): your own
+                      domain once set up, otherwise a temporary link.
+                      Options: --quick, --name <word>, --open, --password, --new-password
+  share setup <domain>
+                      Use your own Cloudflare domain for stable share addresses
+  share reset         Stop using your own domain; back to temporary links
 
   status              Display the status of the Apache server and /etc/hosts routing
   start               Start Apache and route site domains to this Mac (/etc/hosts)
@@ -619,6 +629,611 @@ function errors() {
     fi
 }
 
+# The quick tunnel's public link, as cloudflared logs it. Its log also
+# mentions the API host, which is not the link.
+function share_url_in() {
+    grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$1" | grep -v '^https://api\.' | head -n 1
+}
+
+# Starts a share's cloudflared in the background and waits until interrupted.
+# A stable share knows its address up front and is ready once cloudflared
+# registers a connection; a quick tunnel's address is read from its log.
+# Returns 0 when stopped by a signal, 1 if the tunnel quit after it was ready,
+# 2 if it quit (or was given up on) before; SHARE_LOG then holds its log.
+function run_share_tunnel() {
+    local domain=$1 address=$2 notice=$3
+    shift 3
+    SHARE_LOG=""
+    local log
+    log=$(mktemp -t patchy-share) || return 2
+
+    echo "Requesting a public link for $domain..."
+
+    # A GUI may signal only this process, so cloudflared is stopped explicitly.
+    # The trap is set before launch so an early signal can't orphan it.
+    local pid="" stopping=0
+    trap 'stopping=1; [ -n "$pid" ] && kill -TERM $pid 2>/dev/null' INT TERM HUP
+
+    "$@" >"$log" 2>&1 &
+    pid=$!
+    [ "$stopping" -eq 1 ] && kill -TERM "$pid" 2>/dev/null
+
+    local url=""
+    while [ -z "$url" ] && [ "$stopping" -eq 0 ] && kill -0 "$pid" 2>/dev/null; do
+        if [ -n "$address" ]; then
+            if grep -q 'Registered tunnel connection' "$log"; then
+                url=$address
+            elif grep -q 'Tunnel not found' "$log"; then
+                # A deleted tunnel never exits on its own; cloudflared just retries.
+                kill -TERM "$pid" 2>/dev/null
+                break
+            fi
+        else
+            url=$(share_url_in "$log")
+        fi
+        [ -z "$url" ] && sleep 0.2
+    done
+
+    if [ -n "$url" ] && [ "$stopping" -eq 0 ]; then
+        echo "Sharing $domain at $url"
+        echo "$notice"
+    fi
+
+    # A trapped signal ends wait early, so keep waiting until cloudflared is gone.
+    while kill -0 "$pid" 2>/dev/null; do
+        wait "$pid" 2>/dev/null
+    done
+    trap - INT TERM HUP
+
+    local result=0
+    if [ "$stopping" -eq 1 ]; then
+        echo "Stopped sharing $domain."
+    elif [ -z "$url" ]; then
+        result=2
+    else
+        echo "The link stopped working because cloudflared quit:"
+        tail -n 10 "$log"
+        result=1
+    fi
+    SHARE_LOG=$(<"$log")
+    rm -f "$log"
+    return $result
+}
+
+# Serve one site at a temporary trycloudflare.com link. cloudflared sends the
+# site's name so Apache picks its vhost, and checks the site's mkcert cert
+# against mkcert's root CA.
+function share_quick() {
+    local domain=$1
+    run_share_tunnel "$domain" "" "Anyone with this link can see the site. Press Ctrl-C to stop sharing." \
+        cloudflared tunnel --no-autoupdate \
+            --url https://localhost:443 \
+            --http-host-header "$domain" \
+            --origin-server-name "$domain" \
+            --origin-ca-pool "$(mkcert -CAROOT)/rootCA.pem"
+    local result=$?
+    if [ "$result" -eq 2 ]; then
+        echo "cloudflared stopped before the link was ready:"
+        tail -n 10 <<<"$SHARE_LOG"
+        return 1
+    fi
+    return $result
+}
+
+# The checks every share needs, then a stable or quick share.
+function share_site() {
+    local domain=$1
+    shift
+    local quick=0 name="" protect="" new_password=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --quick) quick=1 ;;
+            --name)
+                name=${2:-}
+                if [ -z "$name" ]; then
+                    echo "Please provide a name after --name."
+                    return 1
+                fi
+                shift
+                ;;
+            --open) protect=open ;;
+            --password) protect=password ;;
+            --new-password) new_password=1 ;;
+            *)
+                echo "Unknown option: $1"
+                return 1
+                ;;
+        esac
+        shift
+    done
+    if [ "$quick" -eq 1 ] && { [ -n "$name" ] || [ -n "$protect" ] || [ "$new_password" -eq 1 ]; }; then
+        echo "--quick can't be combined with other options."
+        return 1
+    fi
+
+    if ! site_exists "$domain"; then
+        echo "Site does not exist... $domain"
+        return 1
+    fi
+    if ! is_apache_running; then
+        echo "Apache isn't running. Start it with: $SCRIPT_NAME start"
+        return 1
+    fi
+    if ! command -v cloudflared >/dev/null 2>&1; then
+        echo "cloudflared is required: brew install cloudflared"
+        return 1
+    fi
+
+    if [ "$quick" -eq 1 ] || ! share_ready; then
+        if [ -n "$name" ] || [ -n "$protect" ] || [ "$new_password" -eq 1 ]; then
+            echo "Set up your own domain first: $SCRIPT_NAME share setup <domain>"
+            return 1
+        fi
+        share_quick "$domain"
+        return
+    fi
+
+    share_prepare "$domain" "$name"
+    case $? in
+        0) ;;
+        3) return 0 ;;
+        *) return 1 ;;
+    esac
+    local dir="$SHARE_DIR/sites/$domain" changed=0
+    case $protect in
+        open) [ -f "$dir/open" ] || { touch "$dir/open"; changed=1; } ;;
+        password) [ -f "$dir/open" ] && { rm -f "$dir/open"; changed=1; } ;;
+    esac
+    if [ "$new_password" -eq 1 ]; then
+        set_share_password "$domain" "$(make_share_password)"
+        changed=1
+    fi
+    if [ "$changed" -eq 1 ]; then
+        apply_share_vhost "$domain" || return 1
+    fi
+    share_stable "$domain"
+}
+
+function share_domain() {
+    cat "$SHARE_DIR/domain" 2>/dev/null
+}
+
+# True once 'patchy share setup' has connected a domain.
+function share_ready() {
+    [ -s "$SHARE_DIR/cert.pem" ] && [ -s "$SHARE_DIR/domain" ]
+}
+
+# cloudflared's tunnel commands, using Patchy's login rather than ~/.cloudflared.
+function cf_tunnel() {
+    cloudflared tunnel --origincert "$SHARE_DIR/cert.pem" "$@"
+}
+
+# The domain a Cloudflare login approved. The login cert holds a token with
+# the zone's ID and an API token that can read the zone's name.
+function cert_zone_name() {
+    local token zone_id api_token
+    token=$(sed -n '/BEGIN ARGO TUNNEL TOKEN/,/END ARGO TUNNEL TOKEN/{/-----/d;p;}' "$1" | tr -d '\n' | base64 --decode 2>/dev/null) || return 1
+    zone_id=$(jq -r '.zoneID // empty' <<<"$token" 2>/dev/null)
+    api_token=$(jq -r '.apiToken // empty' <<<"$token" 2>/dev/null)
+    [ -n "$zone_id" ] && [ -n "$api_token" ] || return 1
+    curl -fsS -H "Authorization: Bearer $api_token" \
+        "https://api.cloudflare.com/client/v4/zones/$zone_id" 2>/dev/null | jq -r '.result.name // empty'
+}
+
+# Connect a Cloudflare domain for stable share addresses. cloudflared's login
+# always writes ~/.cloudflared/cert.pem, so any existing one is set aside and
+# always put back, and the new one moves to Patchy's folder. The login runs in
+# the background so a signal to this process alone (a GUI's Cancel) ends it.
+function share_setup() {
+    local domain=${1:-}
+    if [ -z "$domain" ]; then
+        echo "Please provide your domain, e.g. $SCRIPT_NAME share setup example.com"
+        return 1
+    fi
+    if ! command -v cloudflared >/dev/null 2>&1; then
+        echo "cloudflared is required: brew install cloudflared"
+        return 1
+    fi
+
+    local cf_dir="$HOME/.cloudflared" saved="" login_pid="" interrupted=0
+    trap 'interrupted=1; [ -n "$login_pid" ] && kill -TERM $login_pid 2>/dev/null' INT TERM HUP
+    mkdir -p "$cf_dir"
+    if [ -f "$cf_dir/cert.pem" ]; then
+        if ! saved=$(mktemp -t patchy-cert 2>/dev/null) || ! mv "$cf_dir/cert.pem" "$saved"; then
+            [ -n "$saved" ] && rm -f "$saved"
+            trap - INT TERM HUP
+            echo "Couldn't set your existing ~/.cloudflared/cert.pem aside, so nothing was changed."
+            return 1
+        fi
+    fi
+
+    local approved="" result=1
+    if [ "$interrupted" -eq 0 ]; then
+        echo "Opening Cloudflare in your browser. Choose $domain and click Authorize..."
+        cloudflared tunnel login &
+        login_pid=$!
+        while kill -0 "$login_pid" 2>/dev/null; do
+            wait "$login_pid" 2>/dev/null
+        done
+    fi
+    if [ "$interrupted" -eq 0 ] && [ -f "$cf_dir/cert.pem" ]; then
+        approved=$(cert_zone_name "$cf_dir/cert.pem")
+    fi
+
+    if [ "$interrupted" -eq 1 ] || [ ! -f "$cf_dir/cert.pem" ]; then
+        echo "No domain was connected. $SCRIPT_NAME share will keep giving temporary links."
+    elif [ "$approved" != "$domain" ]; then
+        if [ -n "$approved" ]; then
+            echo "You approved $approved in the browser, not $domain. Run '$SCRIPT_NAME share setup $domain' again and choose $domain."
+        else
+            echo "Couldn't check which domain Cloudflare approved, so nothing was changed."
+        fi
+    else
+        if share_ready && [ "$(share_domain)" != "$domain" ]; then
+            echo "Switching from $(share_domain) to $domain..."
+            share_forget_all
+        fi
+        mkdir -p "$SHARE_DIR" && chmod 700 "$SHARE_DIR"
+        mv "$cf_dir/cert.pem" "$SHARE_DIR/cert.pem" && chmod 600 "$SHARE_DIR/cert.pem"
+        echo "$domain" > "$SHARE_DIR/domain"
+        echo "Connected. $SCRIPT_NAME share will now give each site an address on $domain."
+        result=0
+    fi
+    rm -f "$cf_dir/cert.pem"
+    [ -n "$saved" ] && mv "$saved" "$cf_dir/cert.pem"
+    trap - INT TERM HUP
+    return $result
+}
+
+# Forget every site's stable address (tunnels deleted, DNS records reported).
+function share_forget_all() {
+    local dir
+    for dir in "$SHARE_DIR"/sites/*(N/); do
+        share_forget_site "${dir:t}"
+    done
+    rm -rf "$SHARE_DIR/vhosts"
+}
+
+function share_reset() {
+    if ! share_ready; then
+        echo "No sharing domain is set up. $SCRIPT_NAME share gives temporary links."
+        return 0
+    fi
+    local domain
+    domain=$(share_domain)
+    share_forget_all
+    rm -rf "$SHARE_DIR"
+    is_apache_running && apachectl -k graceful >/dev/null 2>&1
+    echo "Disconnected $domain. $SCRIPT_NAME share will give temporary links again."
+}
+
+# Remove a site's stable address from this Mac and its tunnel from Cloudflare.
+# cloudflared can't delete DNS records, so the leftover one is reported.
+function share_forget_site() {
+    local domain=$1 dir="$SHARE_DIR/sites/$1" host tunnel
+    [ -f "$dir/name" ] || return 0
+    host="$(<"$dir/name").$(share_domain)"
+    tunnel=$(<"$dir/tunnel")
+    if ! cf_tunnel delete -f "$tunnel" >/dev/null 2>&1; then
+        echo "Couldn't delete the tunnel $tunnel on Cloudflare. Delete it in the Cloudflare dashboard (Networks › Tunnels)."
+    fi
+    rm -rf "$dir" "$SHARE_DIR/vhosts/$domain.conf"
+    echo "$host still has a DNS record on Cloudflare. Delete it in the Cloudflare dashboard (DNS) if you don't need it."
+}
+
+# harbor.test → harbor, shop.northwind.test → shop-northwind
+function share_default_name() {
+    local base=${1%.*}
+    echo "${base//./-}"
+}
+
+# One DNS label: Cloudflare's free certificates cover one level under the domain.
+function valid_share_name() {
+    local label='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+    [[ $1 =~ $label ]]
+}
+
+# 12 characters in groups of 4, without look-alikes (0/O, 1/l/I), to read out to a client.
+function make_share_password() {
+    local chars="abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789" pw="" i n
+    for i in {1..12}; do
+        n=$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')
+        pw+=${chars[$(( n % ${#chars} + 1 ))]}
+        (( i % 4 == 0 && i < 12 )) && pw+="-"
+    done
+    echo "$pw"
+}
+
+function set_share_password() {
+    local dir="$SHARE_DIR/sites/$1" pw=$2
+    ( umask 077; echo "$pw" > "$dir/password" )
+    htpasswd -cbB "$dir/htpasswd" "$SHARE_USER" "$pw" >/dev/null 2>&1
+}
+
+# Points a stable address at a tunnel. Never replaces an existing record.
+function share_route() {
+    local tunnel=$1 host=$2 log=$3
+    cf_tunnel route dns "$tunnel" "$host" >"$log" 2>&1 && return 0
+    if grep -qi 'already exists' "$log"; then
+        echo "$host is already used on $(share_domain). Choose another name with --name."
+    else
+        echo "Couldn't create $host on Cloudflare:"
+        tail -n 5 "$log"
+    fi
+    return 1
+}
+
+function write_tunnel_config() {
+    local domain=$1 dir="$SHARE_DIR/sites/$1"
+    cat > "$dir/tunnel.yml" <<EOF
+# Managed by Patchy.
+tunnel: $(jq -r '.TunnelID' "$dir/tunnel.json")
+credentials-file: "$dir/tunnel.json"
+ingress:
+  - hostname: $(<"$dir/name").$(share_domain)
+    service: https://localhost:443
+    originRequest:
+      originServerName: $domain
+      caPool: "$(mkcert -CAROOT)/rootCA.pem"
+  - service: http_status:404
+EOF
+}
+
+# The vhost that answers to a site's stable address: the site's own folder,
+# logs and certificate, plus a password unless the site is shared open.
+function write_share_vhost() {
+    local domain=$1 dir="$SHARE_DIR/sites/$1" docroot auth=""
+    docroot=$(sed -n 's/^[[:space:]]*DocumentRoot[[:space:]]*"\(.*\)".*/\1/p' "$VHOSTS_DIR/$domain.conf" | head -n1)
+    if [ ! -f "$dir/open" ]; then
+        auth="
+    <Location />
+        AuthType Basic
+        AuthName \"Preview\"
+        AuthUserFile \"$dir/htpasswd\"
+        Require valid-user
+    </Location>"
+    fi
+    mkdir -p "$SHARE_DIR/vhosts"
+    cat > "$SHARE_DIR/vhosts/$domain.conf" <<EOF
+# Managed by Patchy — $domain's stable share address.
+<VirtualHost *:443>
+    DocumentRoot "$docroot"
+    ServerName $(<"$dir/name").$(share_domain)
+    ErrorLog "$LOG_DIR/$domain-error_log"
+    CustomLog "$LOG_DIR/$domain-access_log" common
+    # The site's own certificate is used under another name on purpose.
+    LogLevel warn ssl:error
+    SSLEngine on
+    SSLCertificateFile "$CERT_DIR/$domain.pem"
+    SSLCertificateKeyFile "$CERT_DIR/$domain-key.pem"$auth
+</VirtualHost>
+EOF
+}
+
+function ensure_shares_included() {
+    local include_line="IncludeOptional $SHARE_DIR/vhosts/*.conf"
+    [ -n "$(active_line_no "$include_line" "$APACHE_CONFIG")" ] && return 0
+    backup_config
+    echo "$include_line" >> "$APACHE_CONFIG"
+}
+
+# Writes the share vhost and, if it changed or Apache doesn't include it yet,
+# checks it and reloads Apache without dropping connections. If Apache
+# rejects it, the vhost is removed and nothing is reloaded.
+function apply_share_vhost() {
+    local domain=$1 file="$SHARE_DIR/vhosts/$1.conf" before=""
+    [ -f "$file" ] && before=$(<"$file")
+    write_share_vhost "$domain"
+    if [ "$(<"$file")" = "$before" ] \
+        && [ -n "$(active_line_no "IncludeOptional $SHARE_DIR/vhosts/*.conf" "$APACHE_CONFIG")" ]; then
+        return 0
+    fi
+    ensure_shares_included
+    if ! apachectl -t >/dev/null 2>&1; then
+        echo "Apache rejected the sharing setup for $domain, so it was removed:"
+        apachectl -t 2>&1 | tail -n 5
+        rm -f "$file"
+        return 1
+    fi
+    is_apache_running && apachectl -k graceful >/dev/null 2>&1
+    return 0
+}
+
+# Give a site its stable address the first time it is shared: a tunnel of its
+# own, a DNS record, a password and a share vhost. Undone if any step fails or
+# the share is stopped while it runs (status 3). Later shares refresh the
+# tunnel config and vhost, so a changed folder follows.
+function share_prepare() {
+    local domain=$1 want=$2 dir="$SHARE_DIR/sites/$1"
+    if [ -f "$dir/name" ]; then
+        if [ -n "$want" ] && [ "$want" != "$(<"$dir/name")" ]; then
+            share_rename "$domain" "$want"
+            return
+        fi
+        write_tunnel_config "$domain"
+        apply_share_vhost "$domain" || return 1
+        [ -f "$dir/needs-route" ] || return 0
+        local log
+        log=$(mktemp -t patchy-share-route) || return 1
+        if share_route_to_new_tunnel "$domain" "$log"; then
+            rm -f "$log" "$dir/needs-route"
+            return 0
+        fi
+        rm -f "$log"
+        return 1
+    fi
+
+    local name=${want:-$(share_default_name "$domain")}
+    if ! valid_share_name "$name"; then
+        echo "\"$name\" can't be used in a web address. Use lowercase letters, numbers and hyphens."
+        return 1
+    fi
+    # Check everything local before creating anything on Cloudflare, where a
+    # DNS record can't be taken back.
+    if [ ! -f "$CERT_DIR/$domain.pem" ] || [ ! -f "$CERT_DIR/$domain-key.pem" ]; then
+        echo "$domain has no certificate yet. Run '$SCRIPT_NAME refresh-certs' first."
+        return 1
+    fi
+    if ! apachectl -t >/dev/null 2>&1; then
+        echo "Apache's configuration check failed, so nothing was set up for $domain:"
+        apachectl -t 2>&1 | tail -n 5
+        return 1
+    fi
+
+    local host tunnel="patchy-$name" tmp stopping=0 routed=0
+    host="$name.$(share_domain)"
+    trap 'stopping=1' INT TERM HUP
+    echo "Setting up $host (first share only)..."
+    tmp=$(mktemp -d -t patchy-share-site) || { trap - INT TERM HUP; return 1; }
+    if ! cf_tunnel create --credentials-file "$tmp/tunnel.json" "$tunnel" >"$tmp/log" 2>&1; then
+        trap - INT TERM HUP
+        if [ "$stopping" -eq 1 ]; then
+            rm -rf "$tmp"
+            echo "Stopped sharing $domain."
+            return 3
+        fi
+        if grep -qi 'already exists' "$tmp/log"; then
+            echo "The tunnel $tunnel is already used. Choose another name with --name."
+        else
+            echo "Couldn't create a tunnel on Cloudflare:"
+            tail -n 5 "$tmp/log"
+        fi
+        rm -rf "$tmp"
+        return 1
+    fi
+    if [ "$stopping" -eq 0 ]; then
+        if share_route "$tunnel" "$host" "$tmp/log"; then
+            routed=1
+        elif [ "$stopping" -eq 0 ]; then
+            trap - INT TERM HUP
+            cf_tunnel delete -f "$tunnel" >/dev/null 2>&1
+            rm -rf "$tmp"
+            return 1
+        fi
+    fi
+    if [ "$stopping" -eq 1 ]; then
+        trap - INT TERM HUP
+        cf_tunnel delete -f "$tunnel" >/dev/null 2>&1
+        rm -rf "$tmp"
+        [ "$routed" -eq 1 ] && echo "$host still has a DNS record on Cloudflare. Delete it in the Cloudflare dashboard (DNS) if you don't need it."
+        echo "Stopped sharing $domain."
+        return 3
+    fi
+
+    mkdir -p "$dir" && chmod 700 "$SHARE_DIR" "$dir"
+    mv "$tmp/tunnel.json" "$dir/tunnel.json" && chmod 600 "$dir/tunnel.json"
+    rm -rf "$tmp"
+    echo "$name" > "$dir/name"
+    echo "$tunnel" > "$dir/tunnel"
+    set_share_password "$domain" "$(make_share_password)"
+    write_tunnel_config "$domain"
+    if ! apply_share_vhost "$domain"; then
+        trap - INT TERM HUP
+        share_forget_site "$domain"
+        return 1
+    fi
+    trap - INT TERM HUP
+    if [ "$stopping" -eq 1 ]; then
+        share_forget_site "$domain"
+        echo "Stopped sharing $domain."
+        return 3
+    fi
+}
+
+
+# Run a site's own tunnel until interrupted. A tunnel deleted in the
+# dashboard is recreated once, for the site's own recorded address.
+function share_stable() {
+    local domain=$1 dir="$SHARE_DIR/sites/$1" address notice
+    address="https://$(<"$dir/name").$(share_domain)"
+    if [ -f "$dir/open" ]; then
+        notice="Anyone with the address can see the site. Press Ctrl-C to stop sharing."
+    else
+        notice="Username: $SHARE_USER   Password: $(<"$dir/password")"$'\n'"Anyone with the address and password can see the site. Press Ctrl-C to stop sharing."
+    fi
+    local attempt result
+    for attempt in 1 2; do
+        run_share_tunnel "$domain" "$address" "$notice" \
+            cloudflared tunnel --no-autoupdate --origincert "$SHARE_DIR/cert.pem" --config "$dir/tunnel.yml" run
+        result=$?
+        [ "$result" -ne 2 ] && return $result
+        if [ "$attempt" -eq 1 ] && grep -q 'Tunnel not found' <<<"$SHARE_LOG"; then
+            echo "The tunnel for $domain was deleted on Cloudflare. Creating it again..."
+            share_recreate "$domain" || return 1
+            continue
+        fi
+        break
+    done
+    if grep -qiE 'origin cert|unauthori[sz]ed|authentication' <<<"$SHARE_LOG"; then
+        echo "Your Cloudflare login has expired. Run '$SCRIPT_NAME share setup $(share_domain)' again."
+    else
+        echo "cloudflared stopped before the link was ready:"
+        tail -n 10 <<<"$SHARE_LOG"
+    fi
+    return 1
+}
+
+# Move a site to a new stable name on the same tunnel. The old record stays.
+function share_rename() {
+    local domain=$1 want=$2 dir="$SHARE_DIR/sites/$1" old host log
+    if ! valid_share_name "$want"; then
+        echo "\"$want\" can't be used in a web address. Use lowercase letters, numbers and hyphens."
+        return 1
+    fi
+    old="$(<"$dir/name").$(share_domain)"
+    host="$want.$(share_domain)"
+    log=$(mktemp -t patchy-share-route) || return 1
+    if ! share_route "$(<"$dir/tunnel")" "$host" "$log"; then
+        rm -f "$log"
+        return 1
+    fi
+    rm -f "$log"
+    echo "$want" > "$dir/name"
+    write_tunnel_config "$domain"
+    apply_share_vhost "$domain" || return 1
+    echo "$old still has a DNS record on Cloudflare. Delete it in the Cloudflare dashboard (DNS) if you don't need it."
+}
+
+# Recreate a site's tunnel after it was deleted in the dashboard. Its address
+# still points at the old tunnel, and Patchy never replaces a DNS record, so
+# the person deletes that record and shares again.
+function share_recreate() {
+    local domain=$1 dir="$SHARE_DIR/sites/$1" tunnel log
+    tunnel=$(<"$dir/tunnel")
+    log=$(mktemp -t patchy-share-route) || return 1
+    cf_tunnel delete -f "$tunnel" >/dev/null 2>&1
+    rm -f "$dir/tunnel.json"
+    if ! cf_tunnel create --credentials-file "$dir/tunnel.json" "$tunnel" >"$log" 2>&1; then
+        echo "Couldn't create the tunnel again:"
+        tail -n 5 "$log"
+        rm -f "$log"
+        return 1
+    fi
+    chmod 600 "$dir/tunnel.json"
+    write_tunnel_config "$domain"
+    touch "$dir/needs-route"
+    if share_route_to_new_tunnel "$domain" "$log"; then
+        rm -f "$log" "$dir/needs-route"
+        return 0
+    fi
+    rm -f "$log"
+    return 1
+}
+
+# Point a site's own address at its recreated tunnel, without replacing a record.
+function share_route_to_new_tunnel() {
+    local domain=$1 log=$2 dir="$SHARE_DIR/sites/$1" host
+    host="$(<"$dir/name").$(share_domain)"
+    cf_tunnel route dns "$(<"$dir/tunnel")" "$host" >"$log" 2>&1 && return 0
+    if grep -qi 'already exists' "$log"; then
+        echo "$host still points at the deleted tunnel. Delete its DNS record in the Cloudflare dashboard (DNS), then share again."
+    else
+        echo "Couldn't create $host on Cloudflare:"
+        tail -n 5 "$log"
+    fi
+    return 1
+}
+
 # Line number of the first ACTIVE (uncommented) line containing the needle
 function active_line_no() {
     local needle=$1 file=$2
@@ -927,6 +1542,17 @@ function list_sites() {
         # color applied outside the padding so escape codes don't skew column width
         printf "%-${dwidth}s ${color}%-8s${reset} %s\n" "$domain" "$https" "$docroot"
     done < <(list_domains)
+    if share_ready; then
+        local share first=1
+        for share in "$SHARE_DIR"/sites/*(N/); do
+            if [ "$first" -eq 1 ]; then
+                echo ""
+                echo "Share addresses:"
+                first=0
+            fi
+            printf "%-${dwidth}s https://%s.%s\n" "${share:t}" "$(<"$share/name")" "$(share_domain)"
+        done
+    fi
     if [ "$needs_attention" -eq 1 ]; then
         echo ""
         echo "Some certificates expire soon or are invalid. Run 'patchy refresh-certs' to regenerate them."
@@ -948,6 +1574,7 @@ function remove_site() {
 
     remove_domain "$domain" || return 1
     remove_cert "$domain"
+    share_forget_site "$domain"
 }
 
 # Hosts teardown runs FIRST: a declined sudo leaves the site fully intact
@@ -1010,6 +1637,11 @@ function server_status() {
         echo "Trust:  Passwordless /etc/hosts updates enabled"
     elif trust_installed; then
         echo "Trust:  Helper is out of date — run '$SCRIPT_NAME trust' to update it"
+    fi
+    if share_ready; then
+        echo "Share:  Addresses on $(share_domain)"
+    else
+        echo "Share:  Temporary links (run '$SCRIPT_NAME share setup <domain>' to use your own)"
     fi
 }
 
@@ -1344,6 +1976,24 @@ case "${1:-}" in
         if [ "$removed" -eq 1 ]; then
             restart_server
         fi
+        ;;
+    share)
+        case "${2:-}" in
+            "")
+                echo "Please provide a domain."
+                exit 1
+                ;;
+            setup)
+                share_setup "${3:-}"
+                ;;
+            reset)
+                share_reset
+                ;;
+            *)
+                shift
+                share_site "$@"
+                ;;
+        esac
         ;;
     errors)
         errors "${2:-20}"
