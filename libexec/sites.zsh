@@ -2,13 +2,18 @@
 # Sourced by bin/patchy; uses its globals and helpers.
 
 # Offer a www alias on apex adds. Default Yes; non-interactive stdin takes
-# the default so scripted adds don't hang. Prompt goes to stderr because
-# callers capture stdout. The answer is recorded as a ServerAlias — hosts
-# entries, certs, and teardown all derive from that.
+# the default so scripted adds don't hang, and --www / --no-www answer
+# without asking. Prompt goes to stderr because callers capture stdout. The
+# answer is recorded as a ServerAlias — hosts entries, certs, and teardown all
+# derive from that.
 function prompt_www_alias() {
     local domain=$1 alias reply
     alias=$(www_alias_for "$domain")
     [ -n "$alias" ] || return 0
+    case ${PATCHY_WWW:-} in
+        yes) echo "$alias"; return 0 ;;
+        no) return 0 ;;
+    esac
     if [ -t 0 ]; then
         printf "Also serve %s? [Y/n] " "$alias" >&2
         read -r reply
@@ -134,6 +139,18 @@ function root_cert_exists() {
     [ -f "$rootdir/rootCA.pem" ] && [ -f "$rootdir/rootCA-key.pem" ]
 }
 
+# Whether macOS trusts mkcert's CA. mkcert notes it when making a certificate
+# with an untrusted CA, and making a throwaway one never asks for a password
+# (security verify-cert can't tell: it reports even a trusted CA as untrusted).
+function ca_trusted() {
+    local tmp out
+    tmp=$(mktemp -d) || return 1
+    out=$(cd "$tmp" && mkcert -cert-file c.pem -key-file k.pem patchy-probe.test 2>&1)
+    local rc=$?
+    rm -rf "$tmp"
+    [ "$rc" -eq 0 ] && ! grep -q 'not installed in the system trust store' <<<"$out"
+}
+
 # Extra args become SAN names. Filenames are pinned because mkcert's
 # defaults change when a cert has multiple names, and the vhost SSL paths
 # must never move.
@@ -181,6 +198,13 @@ function refresh_certs() {
         restart_server || return 1
     fi
     [ "$failed" -eq 0 ]
+}
+
+# A certificate's expiry as ISO 8601 UTC, e.g. 2027-01-12T00:00:00Z.
+function cert_expires() {
+    local end_date
+    end_date=$(openssl x509 -enddate -noout -in "$1" 2>/dev/null) || return 1
+    LC_ALL=C date -j -u -f "%b %e %T %Y %Z" "${end_date#notAfter=}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
 }
 
 function cert_days_left() {
@@ -242,6 +266,67 @@ function site_cert_state() {
 
 function site_docroot() {
     sed -n 's/^[[:space:]]*DocumentRoot[[:space:]]*"\(.*\)".*/\1/p' "$VHOSTS_DIR/$1.conf" | head -n1
+}
+
+# A site's log file, error or access, as its vhost names it. Sites added by
+# older patchy versions have no logs of their own and use Apache's main ones.
+function site_log() {
+    local directive=ErrorLog log
+    [ "$2" = access ] && directive=CustomLog
+    log=$(sed -n "s/^[[:space:]]*${directive}[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$VHOSTS_DIR/$1.conf" | head -n1)
+    echo "${log:-$LOG_DIR/${2}_log}"
+}
+
+# 'patchy folder <site> <folder>': serve a site from another folder. The
+# folder must exist. The old vhost is put back if Apache rejects the change.
+function set_site_folder() {
+    local domain=${1:-} folder=${2:-}
+    if [ -z "$domain" ] || [ -z "$folder" ]; then
+        fail missing_argument "Please provide a domain and a folder."
+        return 1
+    fi
+    if ! site_exists "$domain"; then
+        fail site_not_found "Site does not exist... $domain"
+        return 1
+    fi
+    if [ ! -d "$folder" ]; then
+        fail folder_not_found "Folder does not exist... $folder"
+        return 1
+    fi
+    folder=$(cd "$folder" && pwd)
+    if [[ $folder == *\"* ]]; then
+        fail invalid_argument "Folder names with a double quote can't be used: $folder"
+        return 1
+    fi
+    local conf="$VHOSTS_DIR/$domain.conf" old line backup
+    old=$(site_docroot "$domain")
+    if [ "$old" = "$folder" ]; then
+        echo "$domain already uses $folder"
+        return 0
+    fi
+    backup=$(mktemp) || return 1
+    cp "$conf" "$backup"
+    {
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [ "$line" = "<Directory \"$old\">" ]; then
+                line="<Directory \"$folder\">"
+            elif [ "${line#"${line%%[![:space:]]*}"}" = "DocumentRoot \"$old\"" ]; then
+                line="${line%%DocumentRoot*}DocumentRoot \"$folder\""
+            fi
+            print -r -- "$line"
+        done < "$backup"
+    } > "$conf"
+    echo "Moving $domain to $folder..."
+    if ! verify_config; then
+        cat "$backup" > "$conf"
+        rm -f "$backup"
+        PATCHY_ERROR_MESSAGE="Apache rejected $domain's new folder, so the site was left as it was"
+        return 1
+    fi
+    rm -f "$backup"
+    if is_apache_running; then
+        restart_server || return 1
+    fi
 }
 
 function list_sites() {
@@ -357,27 +442,56 @@ function remove_domain() {
 }
 
 # 'patchy list --json': {"sites": [...]}, one object per site with its folder
-# (and whether it exists), aliases, certificate and, once shared on your own
-# domain, its stable address.
+# (and whether it exists), aliases, certificate, whether /etc/hosts routes it,
+# its logs and its share: the stable address once shared on your own domain,
+# and the running share, if any.
 function list_sites_json() {
-    local domain docroot state days address
+    local domain docroot state days address routed name running pid mode url auth
     list_domains | while IFS= read -r domain; do
         docroot=$(site_docroot "$domain")
         read -r state days <<<"$(site_cert_state "$domain")"
+        routed=true
+        for name in "$domain" $(list_site_aliases "$domain"); do
+            hosts_entry_exists "$name" || routed=false
+        done
         address=""
         if share_ready && [ -f "$SHARE_DIR/sites/$domain/name" ]; then
             address="https://$(share_host "$domain")"
         fi
+        running=false url="" mode="" auth=""
+        if share_running "$domain"; then
+            running=true
+            { read -r pid; read -r url; read -r mode; read -r auth } < "$SHARE_RUN_DIR/$domain"
+        fi
         jq -nc --arg domain "$domain" --arg docroot "$docroot" \
             --argjson docroot_exists "$([ -d "$docroot" ] && echo true || echo false)" \
             --argjson aliases "$(list_site_aliases "$domain" | jq -R . | jq -sc .)" \
-            --arg state "$state" --arg days "$days" --arg address "$address" '{
+            --arg state "$state" --arg days "$days" \
+            --arg expires "$(cert_expires "$CERT_DIR/$domain.pem")" \
+            --argjson routed "$routed" \
+            --arg error_log "$(site_log "$domain" error)" --arg access_log "$(site_log "$domain" access)" \
+            --arg address "$address" --argjson running "$running" \
+            --arg url "$url" --arg mode "$mode" --arg auth "$auth" '
+            def nul: if . == "" then null else . end;
+            {
                 domain: $domain,
                 docroot: $docroot,
                 docroot_exists: $docroot_exists,
                 aliases: $aliases,
-                certificate: {state: $state, days_left: ($days | if . == "" then null else tonumber end)},
-                share_address: (if $address == "" then null else $address end)
+                certificate: {
+                    state: $state,
+                    days_left: ($days | if . == "" then null else tonumber end),
+                    expires: ($expires | nul)
+                },
+                routed: $routed,
+                logs: {error: ($error_log | nul), access: ($access_log | nul)},
+                share: {
+                    address: ($address | nul),
+                    running: (if $running | not then null else {
+                        url: ($url | nul), mode: ($mode | nul),
+                        password: (if $auth == "" then null else $auth == "auth" end)
+                    } end)
+                }
             }'
-    done | jq -s '{sites: .}'
+    done | jq -s --argjson schema "$PATCHY_SCHEMA" '{schema: $schema, sites: .}'
 }

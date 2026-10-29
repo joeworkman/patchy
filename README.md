@@ -170,7 +170,8 @@ and anonymous links keep working.
 
 | Command | Description |
 |---|---|
-| `patchy add <domain> [dir]` | Add a new site. Docroot defaults to `~/Websites/<domain>`. |
+| `patchy add <domain> [dir]` | Add a new site. Docroot defaults to `~/Websites/<domain>`. `--www` / `--no-www` answer whether to also serve `www.<domain>`; `--yes` skips the question asked before routing a real domain. |
+| `patchy folder <domain> <dir>` | Serve a site from another folder. |
 | `patchy rm <domain>...` | Remove one or more sites. |
 | `patchy share <domain>` | Share a site at a public link until Ctrl-C: an anonymous `trycloudflare.com` link, or an address on your own domain after `patchy share setup`. |
 | `patchy list` | List configured sites. |
@@ -224,13 +225,25 @@ prints the last lines of Apache's error log (`errors -f` has no JSON form):
 
 ```bash
 patchy status --json
-# {"apache": {"running": true}, "hosts": {"names": 28, "routed": 28, "missing": []},
-#  "trust": "enabled", "share_domain": "example.com"}
+# {"schema": 1, "apache": {"running": true},
+#  "php": {"active": "8.4", "installed": [{"formula": "php", "full": "8.5.12", "version": "8.5"},
+#                                         {"formula": "php@8.4", "full": "8.4.27", "version": "8.4"}]},
+#  "hosts": {"names": 28, "routed": 28, "missing": []},
+#  "trust": "enabled", "certificate_authority": {"exists": true, "trusted": true},
+#  "share": {"domain": "example.com", "cloudflared": true},
+#  "paths": {"error_log": "/opt/homebrew/var/log/httpd/error_log",
+#            "httpd_conf": "/opt/homebrew/etc/httpd/httpd.conf",
+#            "php_ini": "/opt/homebrew/etc/php/8.4/php.ini"}}
 
 patchy list --json
-# {"sites": [{"domain": "harbor.test", "docroot": "/Users/you/Websites/harbor",
-#   "docroot_exists": true, "aliases": [], "certificate": {"state": "ok", "days_left": 753},
-#   "share_address": "https://harbor.example.com"}]}
+# {"schema": 1, "sites": [{"domain": "harbor.test", "docroot": "/Users/you/Websites/harbor",
+#   "docroot_exists": true, "aliases": ["www.harbor.test"],
+#   "certificate": {"state": "ok", "days_left": 753, "expires": "2028-11-20T19:29:15Z"},
+#   "routed": true,
+#   "logs": {"error": "/opt/homebrew/var/log/httpd/harbor.test-error_log",
+#            "access": "/opt/homebrew/var/log/httpd/harbor.test-access_log"},
+#   "share": {"address": "https://harbor.example.com",
+#             "running": {"url": "https://harbor.example.com", "mode": "stable", "password": true}}}]}
 
 patchy info --json
 # {"apache": {"version": "2.4.69", "mpm": "prefork", "built": "Sep 29 2026 12:44:27"},
@@ -240,24 +253,38 @@ patchy errors 50 --json
 # {"log": "/opt/homebrew/var/log/httpd/error_log", "lines": ["[Thu Oct 29 ...] ..."]}
 ```
 
-`trust` is `enabled`, `outdated` or `off`. `docroot_exists` is `false` when
-a site's folder has been moved or deleted. A certificate's `state` is `ok`,
-`expiring` (30 days or fewer), `expired`, `invalid` or `none`.
-`share_address` is a site's stable address once it has been shared on your
-own domain, and `null` otherwise.
+Every top-level JSON object, including each `share` event, has `"schema": 1`.
+The number goes up only when a change could break a caller.
 
-`add`, `rm`, `start`, `stop`, `restart`, `check`, `php`, `refresh-certs`,
-`trust`, `untrust` and `share reset` print only one result line:
+In `status`, `php.active` is the PHP that `patchy php` last switched to (its
+`version` matches `installed[].version`). `trust` is `enabled`, `outdated`
+(the helper predates this patchy) or `off`. `certificate_authority.trusted`
+is `false` until macOS trusts mkcert's CA; making it trusted shows a macOS
+password dialog, so `add` and `refresh-certs` may ask once. `share.domain` is
+`null` until `patchy share setup`.
+
+In `list`, `docroot_exists` is `false` when a site's folder has been moved or
+deleted. A certificate's `state` is `ok`, `expiring` (30 days or fewer),
+`expired`, `invalid` or `none`. `routed` is `true` when `/etc/hosts` points
+the domain and every alias at this Mac. `logs` are the files Apache writes
+for the site (Apache's main logs for sites added before per-site logs).
+`share.address` is the site's stable address once it has been shared on your
+own domain; `share.running` is `null` unless a `patchy share` for the site is
+running, and its `url` is `null` until the link is ready.
+
+`add`, `rm`, `folder`, `start`, `stop`, `restart`, `check`, `php`,
+`refresh-certs`, `trust`, `untrust` and `share reset` print only one result
+line:
 
 ```bash
 patchy add harbor.test --json
-# {"ok":true,"warnings":[]}
+# {"schema":1,"ok":true,"warnings":[]}
 
 patchy add harbor.com --json
-# {"ok":false,"error":"confirmation_required","message":"harbor.com looks like a real domain, ...","details":null,"warnings":[]}
+# {"schema":1,"ok":false,"error":"confirmation_required","message":"harbor.com looks like a real domain, ...","details":null,"warnings":[]}
 
 patchy check --json
-# {"ok":true,"warnings":[{"code":"docroot_missing","message":"export.test's folder /Users/you/Desktop/export is missing","site":"export.test"}]}
+# {"schema":1,"ok":true,"warnings":[{"code":"docroot_missing","message":"export.test's folder /Users/you/Desktop/export is missing","site":"export.test"}]}
 ```
 
 `error` is a code that stays the same between releases; `message` is for
@@ -268,13 +295,21 @@ The warning codes are `hosts_update_failed` and `sudo_required` (`/etc/hosts`
 wasn't updated), `docroot_missing` (from `check`) and `tunnel_delete_failed`
 (from `share reset` and `rm`, when Cloudflare kept a tunnel).
 
-With `--json` patchy never asks questions:
+With `--json` patchy never asks questions in the terminal:
 
 - `add` stops with `confirmation_required` before routing a real domain
-  (anything but `.test` and `.local`). Add `--yes` to go ahead.
-- Commands that edit `/etc/hosts` need `patchy trust`. Without it they stop
-  with `sudo_required` instead of asking for a password. `trust` and
-  `untrust` themselves need a password, so run them in Terminal.
+  (anything but `.test` and `.local`). Add `--yes` to go ahead. It serves
+  `www.<domain>` too for a two-part domain like `harbor.test`, unless you add
+  `--no-www`.
+- Commands that need `sudo` (editing `/etc/hosts` without `patchy trust`,
+  and `trust` and `untrust` themselves) stop with `sudo_required` instead of
+  asking for a password.
+
+To let an app ask for the password itself, set `SUDO_ASKPASS` to a program
+that prints it: patchy then runs `sudo -A`, so sudo asks that program, and
+patchy never sees the password. This also lets `trust` and `setup` run
+without a terminal. mkcert's first `-install` is the exception: macOS shows
+its own password dialog for that, whatever `SUDO_ASKPASS` says.
 
 `share --json` runs until stopped, like `share`, and prints nothing but one
 JSON event per line, so it stays parseable even with stderr merged in. The
@@ -282,11 +317,12 @@ link isn't copied to the clipboard.
 
 ```bash
 patchy share harbor.test --auth --json
-# {"event":"ready","site":"harbor.test","url":"https://harbor.example.com","mode":"stable","auth":{"username":"preview","password":"k7Rm-4vQx-92Ld"}}
-# {"event":"stopped","site":"harbor.test"}
+# {"schema":1,"event":"starting","site":"harbor.test"}
+# {"schema":1,"event":"ready","site":"harbor.test","url":"https://harbor.example.com","mode":"stable","auth":{"username":"preview","password":"k7Rm-4vQx-92Ld"}}
+# {"schema":1,"event":"stopped","site":"harbor.test"}
 ```
 
-`ready` comes once the link works: `mode` is `stable`, `temp` or
+`starting` comes first, straight away. `ready` comes once the link works: `mode` is `stable`, `temp` or
 `anonymous`, and `auth` is `null` without `--auth`. The last event is
 `stopped` (exit 0) or `error` (exit 1), which can also come before `ready`.
 `error` has the same `error` code, `message` and `details` as above. To stop
@@ -298,10 +334,13 @@ a share, send `patchy` SIGINT or SIGTERM; it cleans up before `stopped`.
 |---|---|
 | `missing_argument`, `invalid_argument`, `unknown_option`, `conflicting_options` | The command line is wrong |
 | `site_exists`, `site_not_found` | The site is already set up, or isn't |
+| `folder_not_found` | `folder` was given a folder that doesn't exist |
 | `confirmation_required` | `add` needs `--yes` for a real domain |
 | `sudo_required` | A step needs a password; run `patchy trust` once |
 | `hosts_update_failed` | `/etc/hosts` couldn't be changed |
-| `apache_start_failed`, `apache_not_running` | Apache didn't start, or isn't running for a share |
+| `apache_start_failed`, `apache_not_running` | Apache didn't start (`details` has its error), or isn't running for a share |
+| `port_in_use` | Apache didn't start because something else holds port 80 or 443; `details` names it |
+| `service_stuck` | Apache runs fine directly but its launchd service is stuck; `patchy stop`, then `patchy start` |
 | `config_invalid` | Apache rejected the configuration |
 | `cert_failed`, `certificate_missing` | A certificate couldn't be made, or the site has none |
 | `php_not_installed`, `php_link_failed` | Switching PHP failed |

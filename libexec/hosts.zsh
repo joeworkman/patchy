@@ -227,7 +227,7 @@ Normal sudo-prompt mode (without 'trust') still works fine." >&2
 function trust_patchy() {
     if [ "${PATCHY_JSON:-0}" -eq 1 ]; then
         require_sudo "Installing trust" "Run '$SCRIPT_NAME trust' in Terminal." || return 1
-    elif [ ! -t 0 ]; then
+    elif [ ! -t 0 ] && [ -z "${SUDO_ASKPASS:-}" ]; then
         fail terminal_required "Run '$SCRIPT_NAME trust' in an interactive terminal (needs sudo)." >&2
         return 1
     fi
@@ -341,7 +341,7 @@ function migrate_dnsmasq() {
 }
 
 function setup_hosts() {
-    if [ ! -t 0 ]; then
+    if [ ! -t 0 ] && [ -z "${SUDO_ASKPASS:-}" ]; then
         echo "Skipping /etc/hosts configuration (no interactive terminal for sudo)."
         echo "Run '$SCRIPT_NAME setup' in a terminal to finish."
         return 0

@@ -77,6 +77,8 @@ Commands:
   list                  List the sites configured on the Apache server
   add <domain> [dir]    Add a new site (docroot defaults to ~/Websites/<domain>)
                         --yes skips the question asked before routing a real domain
+                        --www / --no-www answer the www.<domain> question
+  folder <domain> <dir> Serve a site from another folder
   rm <domain>...        Remove one or more sites with the specified domains
 
   status                Display the status of the Apache server and /etc/hosts routing
@@ -123,6 +125,14 @@ if (( ${@[(Ie)--yes]} )); then
     set -- "${(@)@:#--yes}"
 fi
 
+# --www / --no-www answer add's question about also serving www.<domain>.
+PATCHY_WWW=""
+if [ "${1:-}" = add ]; then
+    (( ${@[(Ie)--www]} )) && PATCHY_WWW=yes
+    (( ${@[(Ie)--no-www]} )) && PATCHY_WWW=no
+    set -- "${(@)${(@)@:#--www}:#--no-www}"
+fi
+
 # --json, anywhere on the line, gives machine-readable output on stdout: one
 # JSON document for list, status and version, one event per line for share,
 # and one result line ({"ok": ...}) for the commands that change things.
@@ -130,11 +140,11 @@ PATCHY_JSON=0
 if (( ${@[(Ie)--json]} )); then
     PATCHY_JSON=1
     set -- "${(@)@:#--json}"
-    if [[ ${1:-} != (list|status|version|info|check|errors|share|add|rm|start|stop|restart|php|refresh-certs|trust|untrust) ||
+    if [[ ${1:-} != (list|status|version|info|check|errors|share|add|rm|folder|start|stop|restart|php|refresh-certs|trust|untrust) ||
           ( ${1:-} == share && ${2:-} == setup ) ]]; then
         command=${1:-}
         [ "$command" = share ] && command="share ${2:-}"
-        jq -nc --arg command "$command" '{ok: false, error: "json_unsupported",
+        json_doc -c --arg command "$command" '{ok: false, error: "json_unsupported",
             message: "--json does not work with \($command)", details: null, warnings: []}'
         exit 1
     fi
@@ -190,6 +200,9 @@ case "${1:-}" in
         shift
         json_result remove_sites "$@"
         ;;
+    folder)
+        json_result set_site_folder "${2:-}" "${3:-}"
+        ;;
     share)
         case "${2:-}" in
             setup)
@@ -234,9 +247,10 @@ case "${1:-}" in
         if [ "$PATCHY_JSON" -eq 1 ]; then
             # features lets apps check what this patchy can do without
             # comparing version numbers.
-            jq -n --arg version "$(patchy_version)" '{
+            json_doc --arg version "$(patchy_version)" '{
                 version: $version,
-                features: ["json", "add_yes", "share", "share_temp", "share_anonymous", "share_name", "share_auth"]
+                features: ["json", "add_yes", "add_www", "folder", "askpass",
+                    "share", "share_temp", "share_anonymous", "share_name", "share_auth"]
             }'
         else
             echo "patchy $(patchy_version)"
