@@ -315,7 +315,7 @@ If you installed from source: `sudo rm /usr/local/bin/patchy`.
 
 ## Contributing
 
-Issues and pull requests welcome. This is a tool I use every day for real work — improvements that make it more useful or more reliable are gladly accepted. Please run `zsh -n bin/patchy` and `shellcheck bin/patchy` before opening a PR.
+Issues and pull requests welcome. This is a tool I use every day for real work — improvements that make it more useful or more reliable are gladly accepted. Patchy is `bin/patchy` (globals, help and command dispatch) plus one module per area in `libexec/`. Please run `for f in bin/patchy libexec/*.zsh; do zsh -n "$f"; done` and `shellcheck bin/patchy` before opening a PR.
 
 ## License
 
