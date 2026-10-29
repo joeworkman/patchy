@@ -136,6 +136,20 @@ function tail_logs() {
     tail -f "$LOG_DIR"/*
 }
 
+# 'patchy errors --json': {"log": <path>, "lines": [...]}, the last lines of
+# Apache's error log. Following the log (-f) has no JSON form.
+function errors_json() {
+    local arg=$1 log="$LOG_DIR/error_log"
+    if [[ $arg != <1-> ]]; then
+        jq -nc --arg arg "$arg" '{ok: false, error: "invalid_argument",
+            message: "errors --json takes a number of lines, not \($arg)", details: null, warnings: []}'
+        return 1
+    fi
+    local lines="[]"
+    [ -f "$log" ] && lines=$(tail -n "$arg" "$log" | jq -R . | jq -sc .)
+    jq -n --arg log "$log" --argjson lines "$lines" '{log: $log, lines: $lines}'
+}
+
 function errors() {
     local arg=$1
     local log="$LOG_DIR/error_log"
@@ -147,19 +161,35 @@ function errors() {
     fi
 }
 
+# Apache's missing-DocumentRoot warnings (AH00112) are dropped: they name a
+# folder but not the site, so 'check' reports those itself, per site.
 function verify_config() {
-    if apachectl -t; then
+    local out
+    if out=$(apachectl -t 2>&1); then
+        print -r -- "$out" | grep -v AH00112
         echo "Apache configuration is valid."
     else
-        echo "Apache configuration is invalid."
+        fail config_invalid "Apache configuration is invalid." "$out"
         return 1
     fi
-    if php --ini >/dev/null; then
+    if out=$(php --ini 2>&1 >/dev/null); then
         echo "PHP configuration is valid."
     else
-        echo "PHP configuration is invalid."
+        fail config_invalid "PHP configuration is invalid." "$out"
         return 1
     fi
+}
+
+# 'patchy check': the Apache and PHP configuration, then each site's folder.
+function check_config() {
+    verify_config || return 1
+    local domain docroot
+    for domain in $(list_domains); do
+        docroot=$(site_docroot "$domain")
+        [ -d "$docroot" ] && continue
+        warn docroot_missing "$domain's folder $docroot is missing" "$domain"
+        echo "Warning: $domain's folder ${docroot/#$HOME/~} is missing. Create it again, or run '$SCRIPT_NAME rm $domain'."
+    done
 }
 
 function server_status() {
@@ -196,6 +226,22 @@ function server_status() {
 function server_info() {
     echo -e "\033[1mApache Server Info...\033[0m"
     apachectl -V | grep -E 'Server version|Server MPM|Server built'
+}
+
+# 'patchy info --json': Apache's and PHP's versions, and PHP's php.ini.
+function info_json() {
+    local apache
+    apache=$(apachectl -V 2>/dev/null)
+    jq -n --arg apache "$(print -r -- "$apache" | sed -n 's|^Server version: *Apache/\([^ ]*\).*|\1|p')" \
+        --arg mpm "$(print -r -- "$apache" | sed -n 's/^Server MPM: *//p')" \
+        --arg built "$(print -r -- "$apache" | sed -n 's/^Server built: *//p')" \
+        --arg php "$(php -r 'echo PHP_VERSION;' 2>/dev/null)" \
+        --arg ini "$(php -r 'echo php_ini_loaded_file() ?: "";' 2>/dev/null)" '
+        def nul: if . == "" then null else . end;
+        {
+            apache: {version: ($apache | nul), mpm: ($mpm | nul), built: ($built | nul)},
+            php: {version: ($php | nul), ini: ($ini | nul)}
+        }'
 }
 
 # 'patchy status --json': Apache, /etc/hosts routing, the trust helper and the
