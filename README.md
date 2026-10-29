@@ -186,12 +186,13 @@ and anonymous links keep working.
 | `patchy config` | Open `httpd.conf` in your editor. |
 | `patchy ini` | Open the active `php.ini` in your editor. |
 | `patchy logs` | Tail all Apache logs. |
-| `patchy errors [lines\|-f]` | Show the last *N* lines of the Apache error log (default 20), or follow with `-f`. |
+| `patchy errors [site] [lines\|-f]` | Show the last *N* lines of the Apache error log, or of one site's (default 20), or follow with `-f`. Sites added by older versions of patchy share Apache's main log. |
 | `patchy refresh-certs` | Regenerate all local SSL certificates, and make sure macOS trusts mkcert's root CA. |
 | `patchy setup` | One-time setup: Apache user, ports 80/443, required modules, PHP handler, vhost include, `/etc/hosts` routing. Idempotent; auto-run by `brew install`. Re-run it after upgrading from a dnsmasq-based install to migrate away from dnsmasq. |
 | `patchy trust` | Install a root-owned helper so `/etc/hosts` updates on `start`/`stop`/`add`/`rm` stop prompting for a password. |
 | `patchy untrust` | Remove the passwordless helper; `/etc/hosts` updates prompt for a password again. |
 | `patchy help` | Print all of the above. |
+| `patchy docs` | Print this documentation, matching the installed version. |
 
 ### Editor
 
@@ -204,6 +205,26 @@ export EDITOR=vim # or nvim, subl, cursor, etc.
 # or, to wait for the editor to close before returning:
 export VISUAL="code -w"
 ```
+
+### Scripts and AI agents
+
+Patchy works well driven by a script or an AI coding agent. The rules:
+
+- **Add `--json`** to every command that takes it (most do). The output is
+  only JSON, nothing ever prompts, and failures carry a stable `error` code
+  (see below). `patchy docs` prints this whole document.
+- **Read state through commands, never patchy's files.** Its config files and
+  folders are internal and change between releases. `status --json` and
+  `list --json` cover what's running, each site's folder, certificate, logs
+  and share.
+- **Don't rely on prompts.** Use `add <domain> --yes --no-www` (or `--www`).
+- **`sudo_required` needs the person.** Patchy edits `/etc/hosts` with sudo;
+  ask them to run `patchy trust` once in Terminal, then retry.
+- **Some commands never finish.** `share` runs until it is stopped: run it in
+  the background, read lines until the `ready` event, and stop it with
+  SIGTERM. Don't run `logs` or `errors -f`; use `errors <site> 50 --json`.
+- **When a site returns errors,** run `check --json`, then
+  `errors <site> 50 --json`.
 
 ### JSON output
 
@@ -220,8 +241,9 @@ patchy version --json
 #   "share_anonymous", "share_name", "share_auth"]}
 ```
 
-`list`, `status` and `info` print one JSON document, and `errors [lines]`
-prints the last lines of Apache's error log (`errors -f` has no JSON form):
+`list`, `status` and `info` print one JSON document, and `errors [site]
+[lines]` prints the last lines of Apache's or a site's error log (`errors -f`
+has no JSON form):
 
 ```bash
 patchy status --json
@@ -249,8 +271,9 @@ patchy info --json
 # {"apache": {"version": "2.4.69", "mpm": "prefork", "built": "Sep 29 2026 12:44:27"},
 #  "php": {"version": "8.2.35", "ini": "/opt/homebrew/etc/php/8.2/php.ini"}}
 
-patchy errors 50 --json
-# {"log": "/opt/homebrew/var/log/httpd/error_log", "lines": ["[Thu Oct 29 ...] ..."]}
+patchy errors harbor.test 50 --json
+# {"schema": 1, "site": "harbor.test", "log": "/opt/homebrew/var/log/httpd/harbor.test-error_log",
+#  "lines": ["[Thu Oct 29 ...] ..."]}
 ```
 
 Every top-level JSON object, including each `share` event, has `"schema": 1`.
