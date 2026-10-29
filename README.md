@@ -498,4 +498,6 @@ Issues and pull requests welcome. This is a tool I use every day for real work �
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+The code is MIT — see [LICENSE](LICENSE).
+
+The Patchy name and logo (everything in `assets/logo/`) are not covered by the MIT license. You're welcome to use them to refer to Patchy, for example in a blog post, a tutorial or a link to this repo. Please don't use them for other software or services, or in a way that suggests your project is official or endorsed. Projects built on Patchy, like [Patchy UI](https://github.com/jeso87/Patchy-UI), can use the logo with permission.
