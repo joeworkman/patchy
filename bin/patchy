@@ -69,6 +69,7 @@ function show_help() {
 Patchy v$(patchy_version) — a patchy little PHP dev server for macOS (running Apache)
 
 Usage: $SCRIPT_NAME {command} [options]
+       Add --json to list, status or share for machine-readable output.
 
 Commands:
   help                  Show this help message
@@ -100,8 +101,8 @@ Commands:
 
   info                  Display Apache and PHP version information
   version               Display the Patchy version
-  php <version>         Switch to the specified PHP version. You must have it installed via Homebrew.
-  pecl                  Install common PECL extensions (redis, apcu, imagick, yaml, pcov, memcached)
+  php <version>         Switch to the specified PHP version. Must be installed via Homebrew.
+  pecl                  Install common PECL extensions (redis, apcu, imagick, yaml, pcov)
   refresh-certs         Refresh the SSL certificates
 
   setup                 One-time setup: Apache user, ports 80/443, modules, PHP handler, vhost include, DNS
@@ -114,6 +115,18 @@ EOF
 }
 
 # Main script logic to handle different commands
+# --json, anywhere on the line, gives machine-readable output on stdout for
+# list, status and share: one JSON document, or for share one event per line.
+PATCHY_JSON=0
+if (( ${@[(Ie)--json]} )); then
+    PATCHY_JSON=1
+    set -- "${(@)@:#--json}"
+    if [[ ${1:-} != (list|status|share) || ( ${1:-} == share && ${2:-} == (setup|reset) ) ]]; then
+        echo "--json works with list, status and share <domain>."
+        exit 1
+    fi
+fi
+
 case "${1:-}" in
     help)
         show_help
@@ -153,9 +166,13 @@ case "${1:-}" in
         untrust_patchy
         ;;
     list)
-        echo "Sites configured on the Apache server..."
-        echo ""
-        list_sites
+        if [ "$PATCHY_JSON" -eq 1 ]; then
+            list_sites_json
+        else
+            echo "Sites configured on the Apache server..."
+            echo ""
+            list_sites
+        fi
         ;;
     add)
         if [ -z "${2:-}" ]; then
@@ -194,7 +211,7 @@ case "${1:-}" in
                 ;;
             *)
                 shift
-                share_site "$@"
+                share_run "$@"
                 ;;
         esac
         ;;
@@ -205,7 +222,11 @@ case "${1:-}" in
         tail_logs
         ;;
     status)
-        server_status
+        if [ "$PATCHY_JSON" -eq 1 ]; then
+            server_status_json
+        else
+            server_status
+        fi
         ;;
     info)
         server_info

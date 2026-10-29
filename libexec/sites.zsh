@@ -202,12 +202,33 @@ function list_site_aliases() {
     return 0
 }
 
+# A site's certificate as "<state> <days left>". state is ok, expiring (30
+# days or fewer), expired, invalid or none; days is missing when unreadable.
+function site_cert_state() {
+    local cert="$CERT_DIR/$1.pem" days
+    if [ ! -f "$cert" ]; then
+        echo "none"
+    elif ! days=$(cert_days_left "$cert"); then
+        echo "invalid"
+    elif [ "$days" -lt 0 ]; then
+        echo "expired $days"
+    elif [ "$days" -le 30 ]; then
+        echo "expiring $days"
+    else
+        echo "ok $days"
+    fi
+}
+
+function site_docroot() {
+    sed -n 's/^[[:space:]]*DocumentRoot[[:space:]]*"\(.*\)".*/\1/p' "$VHOSTS_DIR/$1.conf" | head -n1
+}
+
 function list_sites() {
     if [ ! -d "$VHOSTS_DIR" ] || [ -z "$(list_domains)" ]; then
         echo "No sites configured."
         return 0
     fi
-    local domain docroot https days needs_attention=0
+    local domain docroot https state days needs_attention=0
     local orange="" red="" reset=""
     if [ -t 1 ]; then
         orange=$'\e[38;5;208m'
@@ -221,26 +242,17 @@ function list_sites() {
     (( dwidth += 3 ))
     printf "%-${dwidth}s %-8s %s\n" "DOMAIN" "HTTPS" "DOCROOT"
     while IFS= read -r domain; do
-        docroot=$(sed -n 's/^[[:space:]]*DocumentRoot[[:space:]]*"\(.*\)".*/\1/p' "$VHOSTS_DIR/$domain.conf" | head -n1)
+        docroot=$(site_docroot "$domain")
         docroot="${docroot/#$HOME/~}"
         local color=""
-        if [ ! -f "$CERT_DIR/$domain.pem" ]; then
-            https="no"
-        elif ! days=$(cert_days_left "$CERT_DIR/$domain.pem"); then
-            https="invalid"
-            color=$red
-            needs_attention=1
-        elif [ "$days" -lt 0 ]; then
-            https="expired"
-            color=$red
-            needs_attention=1
-        elif [ "$days" -le 30 ]; then
-            https="${days}d"
-            color=$orange
-            needs_attention=1
-        else
-            https="${days}d"
-        fi
+        read -r state days <<<"$(site_cert_state "$domain")"
+        case $state in
+            none) https="no" ;;
+            invalid) https="invalid"; color=$red; needs_attention=1 ;;
+            expired) https="expired"; color=$red; needs_attention=1 ;;
+            expiring) https="${days}d"; color=$orange; needs_attention=1 ;;
+            *) https="${days}d" ;;
+        esac
         # color applied outside the padding so escape codes don't skew column width
         printf "%-${dwidth}s ${color}%-8s${reset} %s\n" "$domain" "$https" "$docroot"
     done < <(list_domains)
@@ -291,4 +303,26 @@ function remove_domain() {
     fi
     echo "Removing Apache config file..."
     rm -f "$VHOSTS_DIR/$domain.conf"
+}
+
+# 'patchy list --json': {"sites": [...]}, one object per site with its folder,
+# aliases, certificate and, once shared on your own domain, its stable address.
+function list_sites_json() {
+    local domain state days address
+    list_domains | while IFS= read -r domain; do
+        read -r state days <<<"$(site_cert_state "$domain")"
+        address=""
+        if share_ready && [ -f "$SHARE_DIR/sites/$domain/name" ]; then
+            address="https://$(share_host "$domain")"
+        fi
+        jq -nc --arg domain "$domain" --arg docroot "$(site_docroot "$domain")" \
+            --argjson aliases "$(list_site_aliases "$domain" | jq -R . | jq -sc .)" \
+            --arg state "$state" --arg days "$days" --arg address "$address" '{
+                domain: $domain,
+                docroot: $docroot,
+                aliases: $aliases,
+                certificate: {state: $state, days_left: ($days | if . == "" then null else tonumber end)},
+                share_address: (if $address == "" then null else $address end)
+            }'
+    done | jq -s '{sites: .}'
 }

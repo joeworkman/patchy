@@ -204,6 +204,44 @@ export EDITOR=vim # or nvim, subl, cursor, etc.
 export VISUAL="code -w"
 ```
 
+### JSON output
+
+`list`, `status` and `share` take `--json` for scripts, apps and AI tools.
+`list` and `status` print one JSON document:
+
+```bash
+patchy status --json
+# {"apache": {"running": true}, "hosts": {"names": 28, "routed": 28, "missing": []},
+#  "trust": "enabled", "share_domain": "example.com"}
+
+patchy list --json
+# {"sites": [{"domain": "harbor.test", "docroot": "/Users/you/Websites/harbor",
+#   "aliases": [], "certificate": {"state": "ok", "days_left": 753},
+#   "share_address": "https://harbor.example.com"}]}
+```
+
+`trust` is `enabled`, `outdated` or `off`. A certificate's `state` is `ok`,
+`expiring` (30 days or fewer), `expired`, `invalid` or `none`.
+`share_address` is a site's stable address once it has been shared on your
+own domain, and `null` otherwise.
+
+`share --json` runs until stopped, like `share`, and prints nothing but one
+JSON event per line, so it stays parseable even with stderr merged in. The
+link isn't copied to the clipboard.
+
+```bash
+patchy share harbor.test --auth --json
+# {"event":"ready","site":"harbor.test","url":"https://harbor.example.com","mode":"stable","auth":{"username":"preview","password":"k7Rm-4vQx-92Ld"}}
+# {"event":"stopped","site":"harbor.test"}
+```
+
+`ready` comes once the link works: `mode` is `stable`, `temp` or
+`anonymous`, and `auth` is `null` without `--auth`. The last event is
+`stopped` (exit 0) or `error` (exit 1), which can also come before `ready`.
+`error` has a `message` and, when there is one, `details`, such as the last
+lines of cloudflared's log. To stop a share, send `patchy` SIGINT or SIGTERM; it cleans
+up before `stopped`.
+
 ## Where things live
 
 | | |
