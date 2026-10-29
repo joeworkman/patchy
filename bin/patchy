@@ -63,6 +63,20 @@ function patchy_version() {
     fi
 }
 
+# 'patchy docs': the full documentation (the README) for this version. brew
+# installs it under share/doc; a clone has it at the top.
+function show_docs() {
+    local readme
+    for readme in "${SCRIPT_PATH:h:h}/share/doc/patchy/README.md" "${SCRIPT_PATH:h:h}/README.md"; do
+        if [ -f "$readme" ]; then
+            cat "$readme"
+            return 0
+        fi
+    done
+    echo "The documentation isn't installed. Read it at https://github.com/joeworkman/patchy"
+    return 1
+}
+
 # Function to display help message
 function show_help() {
     cat <<EOF
@@ -73,6 +87,7 @@ Usage: $SCRIPT_NAME {command} [options]
 
 Commands:
   help                  Show this help message
+  docs                  Print the full documentation (for people and AI agents)
 
   list                  List the sites configured on the Apache server
   add <domain> [dir]    Add a new site (docroot defaults to ~/Websites/<domain>)
@@ -112,8 +127,13 @@ Commands:
   trust                 Let patchy update /etc/hosts without a sudo password
   untrust               Remove the passwordless /etc/hosts helper
 
-  errors [lines|-f]     Display the last [lines] of the Apache error log (default 20), or -f to follow
+  errors [site] [lines|-f]
+                        Display the last [lines] of the Apache error log, or of one
+                        site's (default 20), or -f to follow
   logs                  Tail the Apache logs
+
+Scripts and AI agents: add --json for JSON output that never prompts, and run
+'$SCRIPT_NAME docs' for the full documentation, including error codes.
 EOF
 }
 
@@ -153,6 +173,9 @@ fi
 case "${1:-}" in
     help)
         show_help
+        ;;
+    docs)
+        show_docs
         ;;
     start)
         json_result start_server
@@ -218,11 +241,8 @@ case "${1:-}" in
         esac
         ;;
     errors)
-        if [ "$PATCHY_JSON" -eq 1 ]; then
-            errors_json "${2:-20}"
-        else
-            errors "${2:-20}"
-        fi
+        shift
+        show_errors "$@"
         ;;
     logs)
         tail_logs

@@ -80,14 +80,20 @@ function json_result() {
     if [ "$result" -eq 0 ]; then
         json_event --argjson warnings "$(json_warnings)" '{ok: true, warnings: $warnings}' 3>&1
     else
-        json_error_args
-        json_event "${reply[@]}" --argjson warnings "$(json_warnings)" '{
-            ok: false, error: $error, message: $message,
-            details: (if $details == "" then null else $details end),
-            warnings: $warnings
-        }' 3>&1
+        json_failure
     fi
     return $result
+}
+
+# The {"ok": false, ...} line for the last failure. Also used by commands
+# whose success under --json is a document rather than a result line.
+function json_failure() {
+    json_error_args
+    json_doc -c "${reply[@]}" --argjson warnings "$(json_warnings)" '{
+        ok: false, error: $error, message: $message,
+        details: (if $details == "" then null else $details end),
+        warnings: $warnings
+    }'
 }
 
 # sudo for a step that must not prompt under --json: fails with sudo_required

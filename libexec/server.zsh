@@ -152,23 +152,47 @@ function tail_logs() {
     tail -f "$LOG_DIR"/*
 }
 
-# 'patchy errors --json': {"log": <path>, "lines": [...]}, the last lines of
-# Apache's error log. Following the log (-f) has no JSON form.
-function errors_json() {
-    local arg=$1 log="$LOG_DIR/error_log"
-    if [[ $arg != <1-> ]]; then
-        json_doc -c --arg arg "$arg" '{ok: false, error: "invalid_argument",
-            message: "errors --json takes a number of lines, not \($arg)", details: null, warnings: []}'
+# 'patchy errors [site] [lines|-f]': the last lines of Apache's error log, or
+# of one site's. Sites added before per-site logs share Apache's main log.
+# With --json: {"site": ..., "log": <path>, "lines": [...]}; following the
+# log (-f) has no JSON form.
+function show_errors() {
+    local site="" log="$LOG_DIR/error_log" arg
+    if [ -n "${1:-}" ] && [[ $1 != (<1->|-f) ]]; then
+        site=$1
+        shift
+        if ! site_exists "$site"; then
+            fail site_not_found "Site does not exist... $site" >/dev/null
+        else
+            log=$(site_log "$site" error)
+        fi
+    fi
+    arg=${1:-20}
+    if [ -z "$PATCHY_ERROR" ] && [[ $arg != (<1->|-f) ]]; then
+        fail invalid_argument "errors takes a number of lines or -f, not $arg" >/dev/null
+    elif [ -z "$PATCHY_ERROR" ] && [ "$arg" = -f ] && [ "${PATCHY_JSON:-0}" -eq 1 ]; then
+        fail invalid_argument "errors -f follows the log, so it has no JSON form. Give a number of lines." >/dev/null
+    fi
+    if [ -n "$PATCHY_ERROR" ]; then
+        if [ "${PATCHY_JSON:-0}" -eq 1 ]; then
+            json_failure
+        else
+            echo "$PATCHY_ERROR_MESSAGE"
+        fi
         return 1
     fi
-    local lines="[]"
-    [ -f "$log" ] && lines=$(tail -n "$arg" "$log" | jq -R . | jq -sc .)
-    json_doc --arg log "$log" --argjson lines "$lines" '{log: $log, lines: $lines}'
+    if [ "${PATCHY_JSON:-0}" -eq 1 ]; then
+        local lines="[]"
+        [ -f "$log" ] && lines=$(tail -n "$arg" "$log" | jq -R . | jq -sc .)
+        json_doc --arg site "$site" --arg log "$log" --argjson lines "$lines" \
+            '{site: (if $site == "" then null else $site end), log: $log, lines: $lines}'
+    else
+        errors "$log" "$arg"
+    fi
 }
 
 function errors() {
-    local arg=$1
-    local log="$LOG_DIR/error_log"
+    local log=$1 arg=$2
     echo "Error log... $log"
     if [ "$arg" = "-f" ]; then
         tail -f "$log"
