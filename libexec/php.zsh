@@ -20,16 +20,48 @@ function php_installed_json() {
         jq -sc 'sort_by(.version | split(".") | map(tonumber? // 0)) | reverse'
 }
 
-# Resolve the Homebrew formula for a PHP version: "php" for the latest, "php@X.Y" otherwise
+# The X.Y the "php" formula provides: the installed one, or Homebrew's
+# current one when it isn't installed.
+function php_main_version() {
+    local installed
+    installed=$(brew list --versions php 2>/dev/null | awk '{print $NF}')
+    if [ -n "$installed" ]; then
+        echo "${installed%.*}" | cut -d. -f1,2
+    else
+        brew info php --json=v2 2>/dev/null | jq -r '.formulae[0].versions.stable' | cut -d. -f1,2
+    fi
+}
+
+# Resolve the Homebrew formula for a PHP version: "php" when that formula
+# provides it, "php@X.Y" otherwise. Asks the installed php, not Homebrew's
+# formula list: right after 'brew update' the list already says 8.5 while 8.4
+# is still installed as "php", and pinning php@8.4 then (only an alias of the
+# php formula) breaks the moment 'brew upgrade' moves php to 8.5.
 function php_formula_for_version() {
     local version=$1
-    local php_formula="php@$version"
-    local latest_version
-    latest_version=$(brew info php --json=v2 2>/dev/null | jq -r '.formulae[0].versions.stable' | cut -d. -f1,2)
-    if [ "$version" = "$latest_version" ]; then
-        php_formula="php"
+    if [ "$version" = "$(php_main_version)" ]; then
+        echo "php"
+    else
+        echo "php@$version"
     fi
-    echo "$php_formula"
+}
+
+# The PHP module patchy.conf loads, if it's missing: a pinned php@X.Y that was
+# uninstalled, or upgraded away. Apache won't start without it, so start,
+# restart and check fail early and say which version to switch to.
+function check_php_module() {
+    local line module version installed
+    line=$(grep -m1 '^LoadModule php' "$PATCHY_CONF" 2>/dev/null)
+    [ -n "$line" ] || return 0
+    module=${line##* }
+    [ -f "$module" ] && return 0
+    version=$(sed -n 's|.*/opt/php@\([0-9.]*\)/.*|\1|p' <<<"$module")
+    installed=$(php_installed_json | jq -r 'map(.version) | join(", ")')
+    local hint="Install PHP with 'brew install php', then run '$SCRIPT_NAME php <version>'."
+    [ -n "$installed" ] && hint="Run '$SCRIPT_NAME php ${installed%%,*}' to switch (installed: $installed)."
+    fail php_module_missing "Apache is set up for PHP ${version:-from Homebrew}, but its module is missing (uninstalled or upgraded?)." \
+        "$module"$'\n'"$hint"
+    return 1
 }
 
 # Build the Apache LoadModule line for a PHP version/formula

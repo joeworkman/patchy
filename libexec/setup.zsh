@@ -160,9 +160,16 @@ EOF
 # whose module file no longer exists (e.g. the formula was uninstalled),
 # so the next precedence step can self-heal it.
 function detect_php_line() {
-    local line
+    local line version
     line=$(grep -m1 '^LoadModule php' "$PATCHY_CONF" 2>/dev/null)
     if [ -n "$line" ] && [ -f "${line##* }" ]; then
+        # A php@X.Y that the php formula provides is only an alias, gone at
+        # the next upgrade: load it through php instead.
+        version=$(sed -n 's|.*/opt/php@\([0-9.]*\)/.*|\1|p' <<<"${line##* }")
+        if [ -n "$version" ] && [ "$version" = "$(php_main_version)" ]; then
+            php_module_line "$version" php
+            return 0
+        fi
         echo "$line"
         return 0
     fi

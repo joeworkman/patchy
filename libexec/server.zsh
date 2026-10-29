@@ -2,6 +2,7 @@
 # Sourced by bin/patchy; uses its globals and helpers.
 
 function start_server() {
+    check_php_module || return 1
     echo "Starting Apache server..."
     brew services start httpd
     sync_hosts_entries
@@ -111,6 +112,7 @@ function is_apache_running() {
 }
 
 function restart_server() {
+    check_php_module || return 1
     echo "Restarting Apache server..."
     brew services restart httpd
     sync_hosts_entries
@@ -179,6 +181,7 @@ function errors() {
 # folder but not the site, so 'check' reports those itself, per site.
 function verify_config() {
     local out
+    check_php_module || return 1
     if out=$(apachectl -t 2>&1); then
         print -r -- "$out" | grep -v AH00112
         echo "Apache configuration is valid."
