@@ -7,8 +7,7 @@ function start_server() {
     sync_hosts_entries
     legacy_dns_hint
     if ! wait_for_apache; then
-        echo "Warning: Apache did not start."
-        diagnose_startup_failure
+        fail apache_start_failed "Warning: Apache did not start." "$(diagnose_startup_failure)"
         return 1
     fi
 }
@@ -75,6 +74,10 @@ function diagnose_startup_failure() {
 }
 
 function stop_server() {
+    if [ -n "${1:-}" ]; then
+        fail invalid_argument "'stop' no longer takes options — DNS is managed via /etc/hosts automatically."
+        return 1
+    fi
     echo "Stopping Apache server..."
     brew services stop httpd
     if hosts_active; then
@@ -82,6 +85,8 @@ function stop_server() {
         if hosts_sync; then
             echo "Released site domains back to public DNS."
         else
+            warn "${PATCHY_ERROR:-hosts_update_failed}" "/etc/hosts entries were not removed, so site domains still resolve to this Mac."
+            PATCHY_ERROR=""
             echo "Warning: /etc/hosts entries were not removed; site domains still" >&2
             echo "resolve to this Mac. Run '$SCRIPT_NAME stop' again to retry." >&2
         fi
@@ -97,8 +102,7 @@ function restart_server() {
     brew services restart httpd
     sync_hosts_entries
     wait_for_apache && return 0
-    echo "Warning: Apache did not come back up after restart."
-    diagnose_startup_failure
+    fail apache_start_failed "Warning: Apache did not come back up after restart." "$(diagnose_startup_failure)"
     return 1
 }
 

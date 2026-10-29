@@ -21,11 +21,17 @@ function prompt_www_alias() {
 
 # Routing a real domain hides its live site on this Mac — make sure that's
 # intended. .test is fake by definition and .local never leaves the LAN.
+# --yes answers for you; --json can't ask, so it needs --yes.
 function confirm_real_domain() {
     local domain=$1 www=${2:-}
     case "${domain##*.}" in
         test|local) return 0 ;;
     esac
+    [ "${PATCHY_YES:-0}" -eq 1 ] && return 0
+    if [ "${PATCHY_JSON:-0}" -eq 1 ]; then
+        fail confirmation_required "$domain looks like a real domain, which would be unreachable on this Mac while routed here. Add --yes to go ahead."
+        return 1
+    fi
     local names="$domain"
     [ -n "$www" ] && names="$domain (and $www)"
     echo "Routing $names to this Mac. If $domain is a real website, it will be"
@@ -35,17 +41,21 @@ function confirm_real_domain() {
     read -r reply
     case "$reply" in
         y|Y|yes|YES) ;;
-        *) echo "Aborted."; return 1 ;;
+        *) fail cancelled "Aborted."; return 1 ;;
     esac
 }
 
 function add_site() {
-    local domain=$1
+    local domain=${1:-}
     local docroot=${2:-}
+    if [ -z "$domain" ]; then
+        fail missing_argument "Please provide a domain."
+        return 1
+    fi
     [ -z "$docroot" ] && docroot="$DEFAULT_WEBROOT/$domain"
 
     if site_exists "$domain"; then
-        echo "Site already exists... $domain"
+        fail site_exists "Site already exists... $domain"
         return 1
     fi
 
@@ -106,8 +116,12 @@ EOF
 
     if ! verify_config; then
         echo "Rolling back site creation..."
+        local check
+        check=$(apachectl -t 2>&1 | tail -n 5)
         remove_domain "$domain"
         remove_cert "$domain"
+        PATCHY_ERROR=config_invalid PATCHY_ERROR_MESSAGE="Apache rejected $domain's config, so the site was rolled back" \
+            PATCHY_ERROR_DETAILS=$check
         return 1
     fi
 
@@ -133,33 +147,40 @@ function make_cert() {
     mkcert -cert-file "$domain.pem" -key-file "$domain-key.pem" "$@"
 }
 
-function remove_root_certs() {
-    mkcert -uninstall
-    local rootdir
-    rootdir=$(mkcert -CAROOT)
-    rm -f "$rootdir/rootCA.pem" "$rootdir/rootCA-key.pem"
-}
-
 function remove_cert() {
     local domain=$1
     cd "$CERT_DIR" 2>/dev/null || return 0
     rm -f "$domain.pem" "$domain-key.pem"
 }
 
+# Keeps mkcert's root CA (valid for 10 years): replacing it costs two macOS
+# password dialogs, and if the second is cancelled every site ends up signed
+# by a CA the system doesn't trust. 'mkcert -install' asks only when the CA
+# isn't trusted yet, so this repairs trust without prompting otherwise.
 function refresh_certs() {
-    cd "$CERT_DIR" || return 1
-    remove_root_certs
+    mkdir -p "$CERT_DIR" && cd "$CERT_DIR" || {
+        fail cert_failed "Couldn't open $CERT_DIR."
+        return 1
+    }
+    if ! mkcert -install; then
+        fail cert_failed "Couldn't add mkcert's root CA to the system trust store."
+        return 1
+    fi
     make_cert localhost
-    local site
+    local site failed=0
     for site in $(list_domains); do
         [ "$site" = "localhost" ] && continue
         rm -f "$site.pem" "$site-key.pem"
-        make_cert "$site" $(list_site_aliases "$site")
+        if ! make_cert "$site" $(list_site_aliases "$site"); then
+            fail cert_failed "Couldn't create a certificate for $site."
+            failed=1
+        fi
     done
     # Apache keeps serving the old certs from memory until it reloads them
     if is_apache_running; then
-        restart_server
+        restart_server || return 1
     fi
+    [ "$failed" -eq 0 ]
 }
 
 function cert_days_left() {
@@ -282,13 +303,34 @@ function remove_site() {
     local domain=$1
 
     if ! site_exists "$domain"; then
-        echo "Site does not exist... $domain"
+        fail site_not_found "Site does not exist... $domain"
         return 1
     fi
 
     remove_domain "$domain" || return 1
     remove_cert "$domain"
     share_forget_site "$domain"
+}
+
+# 'patchy rm <domain>...': each site is removed even if another fails, then
+# Apache restarts once. Fails if any site couldn't be removed.
+function remove_sites() {
+    if [ $# -eq 0 ]; then
+        fail missing_argument "Please provide one or more domains."
+        return 1
+    fi
+    local domain removed=0 failed=0
+    for domain in "$@"; do
+        if remove_site "$domain"; then
+            removed=1
+        else
+            failed=1
+        fi
+    done
+    if [ "$removed" -eq 1 ]; then
+        restart_server || return 1
+    fi
+    [ "$failed" -eq 0 ]
 }
 
 # Hosts teardown runs FIRST: a declined sudo leaves the site fully intact

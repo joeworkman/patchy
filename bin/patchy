@@ -39,7 +39,7 @@ SCRIPT_PATH="${0:A}"
 
 # Patchy's commands live in libexec/, which sits beside bin/ both in a clone
 # and in brew's Cellar. The list is explicit so a missing file fails loudly.
-for module in server hosts sites setup php share; do
+for module in output server hosts sites setup php share; do
     source "${SCRIPT_PATH:h:h}/libexec/$module.zsh" || exit 1
 done
 unset module
@@ -69,13 +69,14 @@ function show_help() {
 Patchy v$(patchy_version) — a patchy little PHP dev server for macOS (running Apache)
 
 Usage: $SCRIPT_NAME {command} [options]
-       Add --json to list, status or share for machine-readable output.
+       Add --json for machine-readable output (see the README for which commands).
 
 Commands:
   help                  Show this help message
 
   list                  List the sites configured on the Apache server
   add <domain> [dir]    Add a new site (docroot defaults to ~/Websites/<domain>)
+                        --yes skips the question asked before routing a real domain
   rm <domain>...        Remove one or more sites with the specified domains
 
   status                Display the status of the Apache server and /etc/hosts routing
@@ -115,14 +116,26 @@ EOF
 }
 
 # Main script logic to handle different commands
-# --json, anywhere on the line, gives machine-readable output on stdout for
-# list, status and share: one JSON document, or for share one event per line.
+# --yes, anywhere on the line, answers patchy's questions for you.
+PATCHY_YES=0
+if (( ${@[(Ie)--yes]} )); then
+    PATCHY_YES=1
+    set -- "${(@)@:#--yes}"
+fi
+
+# --json, anywhere on the line, gives machine-readable output on stdout: one
+# JSON document for list, status and version, one event per line for share,
+# and one result line ({"ok": ...}) for the commands that change things.
 PATCHY_JSON=0
 if (( ${@[(Ie)--json]} )); then
     PATCHY_JSON=1
     set -- "${(@)@:#--json}"
-    if [[ ${1:-} != (list|status|share) || ( ${1:-} == share && ${2:-} == (setup|reset) ) ]]; then
-        echo "--json works with list, status and share <domain>."
+    if [[ ${1:-} != (list|status|version|share|add|rm|start|stop|restart|php|refresh-certs|trust|untrust) ||
+          ( ${1:-} == share && ${2:-} == (setup|reset) ) ]]; then
+        command=${1:-}
+        [ "$command" = share ] && command="share ${2:-}"
+        jq -nc --arg command "$command" '{ok: false, error: "json_unsupported",
+            message: "--json does not work with \($command)", details: null, warnings: []}'
         exit 1
     fi
 fi
@@ -132,23 +145,19 @@ case "${1:-}" in
         show_help
         ;;
     start)
-        start_server
+        json_result start_server
         ;;
     stop)
-        if [ -n "${2:-}" ]; then
-            echo "'stop' no longer takes options — DNS is managed via /etc/hosts automatically."
-            exit 1
-        fi
-        stop_server
+        json_result stop_server "${2:-}"
         ;;
     restart)
-        restart_server
+        json_result restart_server
         ;;
     check)
         verify_config
         ;;
     refresh-certs)
-        refresh_certs
+        json_result refresh_certs
         ;;
     ini)
         config_php
@@ -160,10 +169,10 @@ case "${1:-}" in
         run_setup
         ;;
     trust)
-        trust_patchy
+        json_result trust_patchy
         ;;
     untrust)
-        untrust_patchy
+        json_result untrust_patchy
         ;;
     list)
         if [ "$PATCHY_JSON" -eq 1 ]; then
@@ -175,34 +184,14 @@ case "${1:-}" in
         fi
         ;;
     add)
-        if [ -z "${2:-}" ]; then
-            echo "Please provide a domain."
-            exit 1
-        fi
-        add_site "$2" "${3:-}"
+        json_result add_site "${2:-}" "${3:-}"
         ;;
     rm)
-        if [ -z "${2:-}" ]; then
-            echo "Please provide one or more domains."
-            exit 1
-        fi
         shift
-        removed=0
-        for domain in "$@"; do
-            if remove_site "$domain"; then
-                removed=1
-            fi
-        done
-        if [ "$removed" -eq 1 ]; then
-            restart_server
-        fi
+        json_result remove_sites "$@"
         ;;
     share)
         case "${2:-}" in
-            "")
-                echo "Please provide a domain."
-                exit 1
-                ;;
             setup)
                 share_setup "${3:-}"
                 ;;
@@ -234,10 +223,19 @@ case "${1:-}" in
         php_info
         ;;
     version|--version|-v)
-        echo "patchy $(patchy_version)"
+        if [ "$PATCHY_JSON" -eq 1 ]; then
+            # features lets apps check what this patchy can do without
+            # comparing version numbers.
+            jq -n --arg version "$(patchy_version)" '{
+                version: $version,
+                features: ["json", "add_yes", "share", "share_temp", "share_anonymous", "share_name", "share_auth"]
+            }'
+        else
+            echo "patchy $(patchy_version)"
+        fi
         ;;
     php)
-        switch_php_version "${2:-}"
+        json_result switch_php_version "${2:-}"
         ;;
     pecl)
         install_pecl_extensions

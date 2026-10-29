@@ -22,26 +22,9 @@ function ensure_cloudflared() {
     return 0
 }
 
-# Print a message that ends a share, with any detail lines (a log's last
-# lines, say), remembering both for --json's error event.
-function share_error() {
-    SHARE_ERROR=${1%:}
-    SHARE_ERROR_DETAILS=${2:-}
-    echo "$1"
-    [ -n "${2:-}" ] && echo "$2"
-    return 0
-}
-
-# With --json, write one event as a JSON line (jq -n arguments) to fd 3, the
-# real stdout; see share_run.
-function share_event() {
-    [ "${PATCHY_JSON:-0}" -eq 1 ] || return 0
-    jq -nc "$@" >&3
-}
-
 # 'patchy share <site>'. With --json, the output is only JSON events, one per
 # line: ready (with the URL and any password) once the link works, then
-# stopped, or error with a message and any details. The usual messages are
+# stopped, or error with a code, a message and any details. The usual messages are
 # dropped, so a caller reading stdout and stderr together still gets clean JSON.
 function share_run() {
     if [ "${PATCHY_JSON:-0}" -ne 1 ]; then
@@ -49,16 +32,16 @@ function share_run() {
         return
     fi
     local result
-    SHARE_ERROR="" SHARE_ERROR_DETAILS=""
-    { share_site "$@" } 3>&1 >/dev/null 2>&1
+    { share_site "$@" } 3>&1 >/dev/null 2>&1 </dev/null
     result=$?
     if [ "$result" -eq 0 ]; then
-        share_event --arg site "${1:-}" '{event: "stopped", site: $site}' 3>&1
+        json_event --arg site "${1:-}" '{event: "stopped", site: $site}' 3>&1
     else
-        share_event --arg site "${1:-}" --arg message "${SHARE_ERROR:-patchy share failed}" \
-            --arg details "$SHARE_ERROR_DETAILS" \
-            '{event: "error", site: $site, message: $message,
-              details: (if $details == "" then null else $details end)}' 3>&1
+        json_error_args
+        json_event --arg site "${1:-}" "${reply[@]}" '{
+            event: "error", site: $site, error: $error, message: $message,
+            details: (if $details == "" then null else $details end)
+        }' 3>&1
     fi
     return $result
 }
@@ -119,7 +102,7 @@ function run_share_tunnel() {
         fi
         echo "Sharing $domain at $url$copied"
         echo "$notice"
-        share_event --arg site "$domain" --arg url "$url" --arg mode "$SHARE_MODE" \
+        json_event --arg site "$domain" --arg url "$url" --arg mode "$SHARE_MODE" \
             --arg username "$SHARE_AUTH_USER" --arg password "$SHARE_AUTH_PASSWORD" '{
                 event: "ready", site: $site, url: $url, mode: $mode,
                 auth: (if $password == "" then null else {username: $username, password: $password} end)
@@ -137,7 +120,7 @@ function run_share_tunnel() {
     elif [ -z "$url" ]; then
         result=2
     else
-        share_error "The link stopped working because cloudflared quit:" \
+        fail tunnel_stopped "The link stopped working because cloudflared quit:" \
             "$(tail -n 10 "$log")"
         result=1
     fi
@@ -159,7 +142,7 @@ function share_quick() {
             --origin-ca-pool "$(mkcert -CAROOT)/rootCA.pem"
     local result=$?
     if [ "$result" -eq 2 ]; then
-        share_error "cloudflared stopped before the link was ready:" \
+        fail tunnel_failed "cloudflared stopped before the link was ready:" \
             "$(tail -n 10 <<<"$SHARE_LOG")"
         return 1
     fi
@@ -169,7 +152,11 @@ function share_quick() {
 # The checks every share needs, then a share on your own domain or an
 # anonymous one.
 function share_site() {
-    local domain=$1
+    local domain=${1:-}
+    if [ -z "$domain" ]; then
+        fail missing_argument "Please provide a domain."
+        return 1
+    fi
     shift
     local temp=0 anonymous=0 name="" auth=0 user=$SHARE_USER password=""
     while [ $# -gt 0 ]; do
@@ -179,7 +166,7 @@ function share_site() {
             --name)
                 name=${2:-}
                 if [ -z "$name" ]; then
-                    share_error "Please provide a name after --name."
+                    fail missing_argument "Please provide a name after --name."
                     return 1
                 fi
                 shift
@@ -189,7 +176,7 @@ function share_site() {
                 # Optional user:pass; the password may itself contain colons.
                 if [ -n "${2:-}" ] && [[ $2 != -* ]]; then
                     if [[ $2 != ?*:?* ]]; then
-                        share_error "Use --auth user:password, or --auth alone for a generated password."
+                        fail invalid_argument "Use --auth user:password, or --auth alone for a generated password."
                         return 1
                     fi
                     user=${2%%:*}
@@ -198,38 +185,38 @@ function share_site() {
                 fi
                 ;;
             *)
-                share_error "Unknown option: $1"
+                fail unknown_option "Unknown option: $1"
                 return 1
                 ;;
         esac
         shift
     done
     if [ "$temp" -eq 1 ] && [ -n "$name" ]; then
-        share_error "--temp makes up its own name, so it can't be combined with --name."
+        fail conflicting_options "--temp makes up its own name, so it can't be combined with --name."
         return 1
     fi
     if [ "$anonymous" -eq 1 ] && { [ -n "$name" ] || [ "$auth" -eq 1 ]; }; then
-        share_error "--anonymous links can't have a --name or --auth."
+        fail conflicting_options "--anonymous links can't have a --name or --auth."
         return 1
     fi
 
     if ! site_exists "$domain"; then
-        share_error "Site does not exist... $domain"
+        fail site_not_found "Site does not exist... $domain"
         return 1
     fi
     if ! is_apache_running; then
-        share_error "Apache isn't running. Start it with: $SCRIPT_NAME start"
+        fail apache_not_running "Apache isn't running. Start it with: $SCRIPT_NAME start"
         return 1
     fi
     if ! command -v cloudflared >/dev/null 2>&1; then
-        share_error "cloudflared is required: brew install cloudflared"
+        fail cloudflared_missing "cloudflared is required: brew install cloudflared"
         return 1
     fi
 
     # Without a domain of your own, every share is an anonymous one.
     if [ "$anonymous" -eq 1 ] || ! share_ready; then
         if [ -n "$name" ] || [ "$auth" -eq 1 ]; then
-            share_error "--name and --auth need your own domain: $SCRIPT_NAME share setup <domain>"
+            fail share_domain_required "--name and --auth need your own domain: $SCRIPT_NAME share setup <domain>"
             return 1
         fi
         SHARE_MODE=anonymous SHARE_AUTH_USER="" SHARE_AUTH_PASSWORD=""
@@ -239,7 +226,7 @@ function share_site() {
 
     local dir="$SHARE_DIR/sites/$domain" host
     if [ -f "$dir/pid" ] && kill -0 "$(<"$dir/pid")" 2>/dev/null; then
-        share_error "$domain is already being shared. Stop that share first."
+        fail already_sharing "$domain is already being shared. Stop that share first."
         return 1
     fi
     share_prepare "$domain" "$name" "$temp" || return 1
@@ -428,7 +415,7 @@ function make_share_password() {
 function write_share_htpasswd() {
     mkdir -p "$SHARE_CONF_DIR"
     if ! htpasswd -iBc "$SHARE_CONF_DIR/$1.htpasswd" "$2" <<<"$3" >/dev/null 2>&1; then
-        share_error "Couldn't set the password for $1."
+        fail password_failed "Couldn't set the password for $1."
         return 1
     fi
     chmod 600 "$SHARE_CONF_DIR/$1.htpasswd"
@@ -457,9 +444,9 @@ function share_route() {
         return 0
     fi
     if grep -qi 'already exists' "$log"; then
-        share_error "$host is already used on $(share_domain). Choose another name with --name."
+        fail name_taken "$host is already used on $(share_domain). Choose another name with --name."
     else
-        share_error "Couldn't create $host on Cloudflare:" \
+        fail cloudflare_error "Couldn't create $host on Cloudflare:" \
             "$(tail -n 5 "$log")"
     fi
     rm -f "$log"
@@ -517,7 +504,7 @@ function ensure_share_hook() {
         END { exit !done }
     ' "$conf" > "$conf.tmp"; then
         rm -f "$conf.tmp"
-        share_error "$conf has no <VirtualHost *:443> block, so $domain can't get a stable address."
+        fail vhost_unsupported "$conf has no <VirtualHost *:443> block, so $domain can't get a stable address."
         return 1
     fi
     mv "$conf.tmp" "$conf"
@@ -557,7 +544,7 @@ function apply_share_conf() {
         return 0
     fi
     if ! apachectl -t >/dev/null 2>&1; then
-        share_error "Apache rejected the sharing setup for $domain, so it was removed:" \
+        fail config_invalid "Apache rejected the sharing setup for $domain, so it was removed:" \
             "$(apachectl -t 2>&1 | tail -n 5)"
         rm -f "$file"
         return 1
@@ -585,7 +572,7 @@ function share_create_tunnel() {
         if ! grep -qi 'already exists' "$log" \
             || ! cf_tunnel delete -f "$tunnel" >/dev/null 2>&1 \
             || ! cf_tunnel create --credentials-file "$dir/tunnel.json" "$tunnel" >"$log" 2>&1; then
-            share_error "Couldn't create a tunnel on Cloudflare:" \
+            fail cloudflare_error "Couldn't create a tunnel on Cloudflare:" \
                 "$(tail -n 5 "$log")"
             rm -f "$log" "$dir/tunnel.json"
             return 1
@@ -606,19 +593,19 @@ function share_prepare() {
     [ -z "$name" ] && [ -f "$dir/name" ] && name=$(<"$dir/name")
     [ -z "$name" ] && name=$(share_default_name "$domain")
     if ! valid_share_name "$name"; then
-        share_error "\"$name\" can't be used in a web address. Use lowercase letters, numbers and hyphens."
+        fail invalid_name "\"$name\" can't be used in a web address. Use lowercase letters, numbers and hyphens."
         return 1
     fi
 
     if [ ! -f "$dir/tunnel.json" ]; then
         # Check everything local before creating anything on Cloudflare.
         if [ ! -f "$CERT_DIR/$domain.pem" ] || [ ! -f "$CERT_DIR/$domain-key.pem" ]; then
-            share_error "$domain has no certificate yet. Run '$SCRIPT_NAME refresh-certs' first."
+            fail certificate_missing "$domain has no certificate yet. Run '$SCRIPT_NAME refresh-certs' first."
             return 1
         fi
         ensure_share_hook "$domain" || return 1
         if ! apachectl -t >/dev/null 2>&1; then
-            share_error "Apache's configuration check failed, so nothing was set up for $domain:" \
+            fail config_invalid "Apache's configuration check failed, so nothing was set up for $domain:" \
                 "$(apachectl -t 2>&1 | tail -n 5)"
             return 1
         fi
@@ -669,11 +656,11 @@ function share_stable() {
         if [ "$result" -eq 2 ]; then
             result=1
             if grep -q 'Tunnel not found' <<<"$SHARE_LOG"; then
-                share_error "The tunnel for $domain was deleted on Cloudflare. Share again to recreate it."
+                fail tunnel_deleted "The tunnel for $domain was deleted on Cloudflare. Share again to recreate it."
             elif grep -qiE 'origin cert|unauthori[sz]ed|authentication' <<<"$SHARE_LOG"; then
-                share_error "Your Cloudflare login has expired. Run '$SCRIPT_NAME share setup $(share_domain)' again."
+                fail cloudflare_login_expired "Your Cloudflare login has expired. Run '$SCRIPT_NAME share setup $(share_domain)' again."
             else
-                share_error "cloudflared stopped before the link was ready:" \
+                fail tunnel_failed "cloudflared stopped before the link was ready:" \
                     "$(tail -n 10 <<<"$SHARE_LOG")"
             fi
         fi
