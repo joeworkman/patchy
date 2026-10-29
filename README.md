@@ -91,10 +91,11 @@ patchy rm example.com && patchy add example.com <docroot>
 
 ## Sharing a site
 
-`patchy share <domain>` gives a site a temporary public link through a free
-[Cloudflare quick tunnel](https://try.cloudflare.com) — handy for showing a
-client a preview without deploying. It needs `cloudflared`
-(`brew install cloudflared`) and no Cloudflare account.
+`patchy share <domain>` puts a local site on a public link until you press
+Ctrl-C — handy for showing a client a preview without deploying. Out of the
+box it gives an anonymous link through a free
+[Cloudflare quick tunnel](https://try.cloudflare.com), with no Cloudflare
+account needed; `cloudflared` is installed with Patchy.
 
 ```bash
 patchy share example.test
@@ -114,38 +115,56 @@ for example) may redirect visitors to `example.test`, which they can't reach.
 ### Stable addresses on your own domain
 
 If you have a domain on Cloudflare, each site can get a stable address a
-client can bookmark, like `harbor.example.com`, instead of a new random one
-every time:
+client can bookmark, like `harbor.example.com`, with an optional password:
 
 ```bash
 patchy share setup example.com   # once: approve example.com in the browser
-patchy share harbor.test
-# Setting up harbor.example.com (first share only)...
+patchy share harbor.test --auth
+# Setting up sharing for harbor.test (first share only)...
 # Sharing harbor.test at https://harbor.example.com
 # Username: preview   Password: k7Rm-4vQx-92Ld
 ```
 
-Nothing is reachable until you share a site, and only while the command
-runs. Each site gets its own Cloudflare tunnel and DNS record the first time
-it's shared, and a password unless you share it with `--open`. Patchy never
-replaces an existing DNS record, so your live subdomains are safe.
+The address only exists while you share. Each share creates its DNS record,
+and stopping deletes it again, so nothing is left on your domain. Only one
+share of a site runs at a time. Each site
+also gets a Cloudflare tunnel on its first share; it's invisible and free,
+and stays until `patchy rm` or `patchy share reset`. Patchy never replaces or
+deletes a DNS record that isn't its own, so your live subdomains are safe.
+
+The address is an alias of the site's own vhost, so the public site behaves
+exactly like the local one, and the site sees the public address as its host.
+The first share adds one `IncludeOptional` line to the site's
+`<VirtualHost *:443>` block, pointing at
+`$(brew --prefix)/etc/httpd/share/<site>.conf`. Only visitors at the public
+address are asked for the password; the local domain never is.
 
 | Option | |
 |---|---|
-| `--name <word>` | Use `<word>.example.com` (default: the local name, dots as hyphens). |
-| `--open` / `--password` | Share without / with a password. Remembered per site. |
-| `--new-password` | Make a new password. |
-| `--quick` | A temporary `trycloudflare.com` link this time. |
+| `--name <word>` | Use `<word>.example.com` (default: the local name, dots as hyphens). Remembered per site. |
+| `--auth` | Require a password for this share: username `preview` and a new password each time. |
+| `--auth user:pass` | Require your own username and password instead. It ends up in your shell history. |
+| `--temp` | A random address on your domain (`k7rm4vqx.example.com`), new each share and never saved. Works with `--auth`. |
+| `--anonymous` | An anonymous `trycloudflare.com` link instead, as without a domain. Can't be combined with `--name` or `--auth`. |
 
 Addresses are one level deep (`harbor.example.com`, not
 `harbor.preview.example.com`) because Cloudflare's free certificates only
-cover one level. `patchy rm` deletes a site's tunnel, but cloudflared can't
-delete DNS records, so Patchy tells you which ones to remove in the
-Cloudflare dashboard. `patchy share reset` disconnects the domain.
+cover one level. `patchy share reset` disconnects the domain.
 
-Patchy keeps its Cloudflare login in its own folder
-(`$(brew --prefix)/etc/httpd/share`), not `~/.cloudflared`, so your own
-cloudflared setup and quick links keep working.
+If a share is killed outright (a crash, a closed laptop lid mid-share), its
+DNS record stays behind. The next share of that site, or `patchy rm`, removes
+it: Patchy deletes any record pointing at the site's tunnel, and nothing
+else. A tunnel deleted in the Cloudflare dashboard is recreated on the next
+share. Someone who visits while you aren't sharing gets "no
+such host", and their network may remember that for a while, so the address
+can take a few minutes to work for them after you start sharing.
+
+Passwords are never stored: Apache's password file exists only while the
+share runs.
+
+Patchy keeps its Cloudflare login and tunnel credentials in
+`~/.config/patchy/share`, not `~/.cloudflared`, so your own cloudflared setup
+and anonymous links keep working.
 
 ## Commands
 
@@ -153,7 +172,7 @@ cloudflared setup and quick links keep working.
 |---|---|
 | `patchy add <domain> [dir]` | Add a new site. Docroot defaults to `~/Websites/<domain>`. |
 | `patchy rm <domain>...` | Remove one or more sites. |
-| `patchy share <domain>` | Share a site at a public link until Ctrl-C: a temporary `trycloudflare.com` link, or a stable address on your own domain after `patchy share setup`. Needs `cloudflared`. |
+| `patchy share <domain>` | Share a site at a public link until Ctrl-C: an anonymous `trycloudflare.com` link, or an address on your own domain after `patchy share setup`. |
 | `patchy list` | List configured sites. |
 | `patchy start` / `stop` | Start/stop Apache. `start` routes every configured site to this Mac via `/etc/hosts`; `stop` releases those entries, so real domains resolve normally again immediately. |
 | `patchy restart` | Restart Apache and repair `/etc/hosts` routing if any entries went missing. |
@@ -215,7 +234,6 @@ If your stack targets Nginx + FPM, Valet or Herd will probably serve you better.
 - [Homebrew](https://brew.sh)
 - `sudo` access — needed to edit `/etc/hosts` during `patchy setup`, `start`, `stop`, `add`, and `rm`, unless you run `patchy trust` once (see below)
 - `zsh` (the default shell on modern macOS)
-- `cloudflared`, only for `patchy share` (`brew install cloudflared`)
 
 > **Note:** Apache binds ports 80/443 with a wildcard bind, which needs no root on modern macOS but is reachable from your local network (handy for testing from a phone). The macOS firewall may ask once to allow `httpd`.
 
