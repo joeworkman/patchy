@@ -27,6 +27,8 @@ function sync_hosts_entries() {
     [ -n "$(list_domains)" ] || return 0
     hosts_sudo_note
     if ! hosts_sync $(list_hosts_names); then
+        warn "${PATCHY_ERROR:-hosts_update_failed}" "/etc/hosts was not updated, so sites won't resolve locally."
+        PATCHY_ERROR=""
         echo "Warning: /etc/hosts was not updated — sites will not resolve locally." >&2
         echo "Run '$SCRIPT_NAME start' again to retry." >&2
         return 1
@@ -118,6 +120,7 @@ function hosts_sync() {
 # name resolution).
 function hosts_sync_inline() {
     local domain tmp
+    require_sudo "Updating /etc/hosts" || return 1
     tmp=$(mktemp) || return 1
     {
         grep -v '# patchy$' /etc/hosts
@@ -129,6 +132,7 @@ function hosts_sync_inline() {
     sudo /usr/bin/install -m 644 -o root -g wheel "$tmp" /etc/hosts
     local rc=$?
     rm -f "$tmp"
+    [ "$rc" -eq 0 ] || fail hosts_update_failed "Couldn't update /etc/hosts." >&2
     return $rc
 }
 
@@ -203,7 +207,7 @@ EOF
 function assert_root_owned_path() {
     local dir=$1 info uid perm group_bit other_bit
     info=$(stat -f '%u %Lp' "$dir" 2>/dev/null) || {
-        echo "Error: cannot stat $dir; trust cannot be safely installed." >&2
+        fail unsafe_path "Error: cannot stat $dir; trust cannot be safely installed." >&2
         return 1
     }
     uid=${info%% *}
@@ -211,18 +215,20 @@ function assert_root_owned_path() {
     group_bit=${perm[-2]}
     other_bit=${perm[-1]}
     if [ "$uid" -ne 0 ] || (( (group_bit & 2) || (other_bit & 2) )); then
-        echo "Error: $dir is owned by uid $uid with mode $perm — writable by" >&2
-        echo "non-root, so trust cannot be safely installed. The sudoers rule" >&2
-        echo "trusts the path $HELPER_PATH, and anyone able to write to $dir" >&2
-        echo "could substitute their own helper and gain passwordless root." >&2
-        echo "Normal sudo-prompt mode (without 'trust') still works fine." >&2
+        fail unsafe_path "Error: $dir is owned by uid $uid with mode $perm — writable by" \
+            "non-root, so trust cannot be safely installed. The sudoers rule
+trusts the path $HELPER_PATH, and anyone able to write to $dir
+could substitute their own helper and gain passwordless root.
+Normal sudo-prompt mode (without 'trust') still works fine." >&2
         return 1
     fi
 }
 
 function trust_patchy() {
-    if [ ! -t 0 ]; then
-        echo "Run '$SCRIPT_NAME trust' in an interactive terminal (needs sudo)." >&2
+    if [ "${PATCHY_JSON:-0}" -eq 1 ]; then
+        require_sudo "Installing trust" "Run '$SCRIPT_NAME trust' in Terminal." || return 1
+    elif [ ! -t 0 ]; then
+        fail terminal_required "Run '$SCRIPT_NAME trust' in an interactive terminal (needs sudo)." >&2
         return 1
     fi
 
@@ -240,7 +246,7 @@ function trust_patchy() {
     tmp_helper=$(mktemp) || return 1
     write_hosts_helper > "$tmp_helper" || { rm -f "$tmp_helper"; return 1; }
     if [ ! -s "$tmp_helper" ]; then
-        echo "Error: generated helper script is empty; nothing installed." >&2
+        fail trust_failed "Error: generated helper script is empty; nothing installed." >&2
         rm -f "$tmp_helper"
         return 1
     fi
@@ -250,7 +256,7 @@ function trust_patchy() {
     # A malformed sudoers.d file can break sudo entirely — validate before
     # anything is installed.
     if ! visudo -cf "$tmp_sudoers" >/dev/null; then
-        echo "Error: generated sudoers rule failed validation; nothing installed." >&2
+        fail trust_failed "Error: generated sudoers rule failed validation; nothing installed." >&2
         rm -f "$tmp_helper" "$tmp_sudoers"
         return 1
     fi
@@ -261,7 +267,7 @@ function trust_patchy() {
     local rc=$?
     rm -f "$tmp_helper" "$tmp_sudoers"
     if [ "$rc" -ne 0 ]; then
-        echo "Trust setup failed — run '$SCRIPT_NAME untrust' to remove any partial install." >&2
+        fail trust_failed "Trust setup failed — run '$SCRIPT_NAME untrust' to remove any partial install." >&2
         return 1
     fi
     echo "Done. start/stop/add/rm will no longer prompt for a password."
@@ -272,8 +278,12 @@ function untrust_patchy() {
         echo "Trust is not installed."
         return 0
     fi
+    require_sudo "Removing trust" "Run '$SCRIPT_NAME untrust' in Terminal." || return 1
     echo "Removing the sudoers rule and helper (requires sudo)..."
-    sudo rm -f "$SUDOERS_FILE" "$HELPER_PATH"
+    if ! sudo rm -f "$SUDOERS_FILE" "$HELPER_PATH"; then
+        fail trust_failed "Couldn't remove the sudoers rule and helper."
+        return 1
+    fi
     echo "Done. /etc/hosts updates will prompt for your password again."
 }
 

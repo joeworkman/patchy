@@ -33,7 +33,7 @@ function php_module_line() {
 
 function switch_php_version() {
     if [ -z "${1:-}" ]; then
-        echo "Please provide a PHP version (e.g., 7.4, 8.1, 8.2, 8.3, 8.4, 8.5)"
+        fail missing_argument "Please provide a PHP version (e.g., 7.4, 8.1, 8.2, 8.3, 8.4, 8.5)"
         return 1
     fi
 
@@ -42,8 +42,7 @@ function switch_php_version() {
     php_formula=$(php_formula_for_version "$version")
 
     if ! brew list --formula 2>/dev/null | grep -E "^${php_formula}\$" >/dev/null; then
-        echo "$php_formula is not installed."
-        echo "Install it with: brew install $php_formula"
+        fail php_not_installed "$php_formula is not installed." "Install it with: brew install $php_formula"
         return 1
     fi
 
@@ -57,7 +56,10 @@ function switch_php_version() {
     done
 
     echo "Linking PHP $version..."
-    brew link --force --overwrite "$php_formula"
+    if ! brew link --force --overwrite "$php_formula"; then
+        fail php_link_failed "Couldn't link $php_formula."
+        return 1
+    fi
 
     echo "Updating Apache configuration..."
 
@@ -73,7 +75,7 @@ function switch_php_version() {
     ensure_sites_included
     ensure_patchy_included
 
-    restart_server
+    restart_server || return 1
 
     echo ""
     echo "PHP version switched to:"

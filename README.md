@@ -186,7 +186,7 @@ and anonymous links keep working.
 | `patchy ini` | Open the active `php.ini` in your editor. |
 | `patchy logs` | Tail all Apache logs. |
 | `patchy errors [lines\|-f]` | Show the last *N* lines of the Apache error log (default 20), or follow with `-f`. |
-| `patchy refresh-certs` | Regenerate all local SSL certificates. |
+| `patchy refresh-certs` | Regenerate all local SSL certificates, and make sure macOS trusts mkcert's root CA. |
 | `patchy setup` | One-time setup: Apache user, ports 80/443, required modules, PHP handler, vhost include, `/etc/hosts` routing. Idempotent; auto-run by `brew install`. Re-run it after upgrading from a dnsmasq-based install to migrate away from dnsmasq. |
 | `patchy trust` | Install a root-owned helper so `/etc/hosts` updates on `start`/`stop`/`add`/`rm` stop prompting for a password. |
 | `patchy untrust` | Remove the passwordless helper; `/etc/hosts` updates prompt for a password again. |
@@ -206,7 +206,19 @@ export VISUAL="code -w"
 
 ### JSON output
 
-`list`, `status` and `share` take `--json` for scripts, apps and AI tools.
+`--json` gives output for scripts, apps and AI tools. It is the supported
+interface: patchy's config files and folders are internal and can change in
+any release, so read state through these commands rather than from the files.
+
+`patchy version --json` reports the version and what this patchy can do, so
+an app can check for a feature instead of comparing version numbers:
+
+```bash
+patchy version --json
+# {"version": "1.3.0", "features": ["json", "add_yes", "share", "share_temp",
+#   "share_anonymous", "share_name", "share_auth"]}
+```
+
 `list` and `status` print one JSON document:
 
 ```bash
@@ -225,6 +237,30 @@ patchy list --json
 `share_address` is a site's stable address once it has been shared on your
 own domain, and `null` otherwise.
 
+`add`, `rm`, `start`, `stop`, `restart`, `php`, `refresh-certs`, `trust` and
+`untrust` print only one result line:
+
+```bash
+patchy add harbor.test --json
+# {"ok":true,"warnings":[]}
+
+patchy add harbor.com --json
+# {"ok":false,"error":"confirmation_required","message":"harbor.com looks like a real domain, ...","details":null,"warnings":[]}
+```
+
+`error` is a code that stays the same between releases; `message` is for
+people and can change. `details` holds extra lines, such as Apache's startup
+error, or is `null`. `warnings` lists problems that didn't stop the command,
+each with a `code` and `message`.
+
+With `--json` patchy never asks questions:
+
+- `add` stops with `confirmation_required` before routing a real domain
+  (anything but `.test` and `.local`). Add `--yes` to go ahead.
+- Commands that edit `/etc/hosts` need `patchy trust`. Without it they stop
+  with `sudo_required` instead of asking for a password. `trust` and
+  `untrust` themselves need a password, so run them in Terminal.
+
 `share --json` runs until stopped, like `share`, and prints nothing but one
 JSON event per line, so it stays parseable even with stderr merged in. The
 link isn't copied to the clipboard.
@@ -238,9 +274,29 @@ patchy share harbor.test --auth --json
 `ready` comes once the link works: `mode` is `stable`, `temp` or
 `anonymous`, and `auth` is `null` without `--auth`. The last event is
 `stopped` (exit 0) or `error` (exit 1), which can also come before `ready`.
-`error` has a `message` and, when there is one, `details`, such as the last
-lines of cloudflared's log. To stop a share, send `patchy` SIGINT or SIGTERM; it cleans
-up before `stopped`.
+`error` has the same `error` code, `message` and `details` as above. To stop
+a share, send `patchy` SIGINT or SIGTERM; it cleans up before `stopped`.
+
+#### Error codes
+
+| Code | Meaning |
+|---|---|
+| `missing_argument`, `invalid_argument`, `unknown_option`, `conflicting_options` | The command line is wrong |
+| `site_exists`, `site_not_found` | The site is already set up, or isn't |
+| `confirmation_required` | `add` needs `--yes` for a real domain |
+| `sudo_required` | A step needs a password; run `patchy trust` once |
+| `hosts_update_failed` | `/etc/hosts` couldn't be changed |
+| `apache_start_failed`, `apache_not_running` | Apache didn't start, or isn't running for a share |
+| `config_invalid` | Apache rejected the configuration |
+| `cert_failed`, `certificate_missing` | A certificate couldn't be made, or the site has none |
+| `php_not_installed`, `php_link_failed` | Switching PHP failed |
+| `trust_failed`, `unsafe_path`, `terminal_required` | `trust` or `untrust` failed |
+| `cloudflared_missing`, `cloudflare_error`, `cloudflare_login_expired` | cloudflared or Cloudflare failed |
+| `share_domain_required`, `invalid_name`, `name_taken` | `--name`/`--auth` need your own domain, or the name can't be used |
+| `already_sharing`, `password_failed`, `vhost_unsupported` | The share couldn't start |
+| `tunnel_failed`, `tunnel_stopped`, `tunnel_deleted` | The tunnel failed to start, stopped, or was deleted on Cloudflare |
+| `json_unsupported` | The command doesn't take `--json` |
+| `cancelled`, `failed` | Cancelled at a prompt, or an unexpected failure |
 
 ## Where things live
 
