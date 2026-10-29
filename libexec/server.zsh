@@ -193,3 +193,26 @@ function server_info() {
     echo -e "\033[1mApache Server Info...\033[0m"
     apachectl -V | grep -E 'Server version|Server MPM|Server built'
 }
+
+# 'patchy status --json': Apache, /etc/hosts routing, the trust helper and the
+# sharing domain. trust is enabled, outdated or off.
+function server_status_json() {
+    local running=false trust=off d domains=($(list_hosts_names)) missing=()
+    is_apache_running && running=true
+    for d in "${domains[@]}"; do
+        hosts_entry_exists "$d" || missing+=("$d")
+    done
+    if trust_active; then
+        trust=enabled
+    elif trust_installed; then
+        trust=outdated
+    fi
+    jq -n --argjson running "$running" --argjson names "${#domains[@]}" \
+        --argjson missing "$(print -rl -- "${missing[@]}" | jq -R 'select(. != "")' | jq -sc .)" \
+        --arg trust "$trust" --arg share_domain "$(share_ready && share_domain)" '{
+            apache: {running: $running},
+            hosts: {names: $names, routed: ($names - ($missing | length)), missing: $missing},
+            trust: $trust,
+            share_domain: (if $share_domain == "" then null else $share_domain end)
+        }'
+}
