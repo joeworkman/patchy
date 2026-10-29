@@ -8,6 +8,7 @@ SHARE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/patchy/share"
 # Apache's side of each stable address: a file the site's own :443 vhost
 # includes, and the password file of a share run with --auth
 SHARE_CONF_DIR="$BREW_PREFIX/etc/httpd/share"
+SHARE_RUN_DIR="$SHARE_DIR/running"
 
 # The username --auth uses when none is given
 SHARE_USER="preview"
@@ -23,7 +24,7 @@ function ensure_cloudflared() {
 }
 
 # 'patchy share <site>'. With --json, the output is only JSON events, one per
-# line: ready (with the URL and any password) once the link works, then
+# line: starting, ready (with the URL and any password) once the link works, then
 # stopped, or error with a code, a message and any details. The usual messages are
 # dropped, so a caller reading stdout and stderr together still gets clean JSON.
 function share_run() {
@@ -32,6 +33,7 @@ function share_run() {
         return
     fi
     local result
+    json_event --arg site "${1:-}" '{event: "starting", site: $site}' 3>&1
     { share_site "$@" } 3>&1 >/dev/null 2>&1 </dev/null
     result=$?
     if [ "$result" -eq 0 ]; then
@@ -102,6 +104,8 @@ function run_share_tunnel() {
         fi
         echo "Sharing $domain at $url$copied"
         echo "$notice"
+        printf '%s\n' "$url" "$SHARE_MODE" "$([ -n "$SHARE_AUTH_PASSWORD" ] && echo auth || echo open)" \
+            >> "$SHARE_RUN_DIR/$domain"
         json_event --arg site "$domain" --arg url "$url" --arg mode "$SHARE_MODE" \
             --arg username "$SHARE_AUTH_USER" --arg password "$SHARE_AUTH_PASSWORD" '{
                 event: "ready", site: $site, url: $url, mode: $mode,
@@ -213,42 +217,47 @@ function share_site() {
         return 1
     fi
 
-    # Without a domain of your own, every share is an anonymous one.
-    if [ "$anonymous" -eq 1 ] || ! share_ready; then
-        if [ -n "$name" ] || [ "$auth" -eq 1 ]; then
-            fail share_domain_required "--name and --auth need your own domain: $SCRIPT_NAME share setup <domain>"
-            return 1
-        fi
-        SHARE_MODE=anonymous SHARE_AUTH_USER="" SHARE_AUTH_PASSWORD=""
-        share_quick "$domain"
-        return
-    fi
-
-    local dir="$SHARE_DIR/sites/$domain" host
-    if [ -f "$dir/pid" ] && kill -0 "$(<"$dir/pid")" 2>/dev/null; then
+    if share_running "$domain"; then
         fail already_sharing "$domain is already being shared. Stop that share first."
         return 1
     fi
-    share_prepare "$domain" "$name" "$temp" || return 1
-    if [ "$temp" -eq 1 ]; then
-        host="$(share_random_name).$(share_domain)"
-    else
-        host=$(share_host "$domain")
-    fi
-    # Open unless this share asks for a password. Nothing is kept: a generated
-    # password is new every share, and the password file goes when it stops.
-    if [ "$auth" -eq 1 ]; then
-        [ -z "$password" ] && password=$(make_share_password)
-        write_share_htpasswd "$domain" "$user" "$password" || return 1
-    else
-        user="" password=""
-        rm -f "$SHARE_CONF_DIR/$domain.htpasswd"
-    fi
-    write_tunnel_config "$domain" "$host"
-    apply_share_conf "$domain" "$host" || return 1
-    SHARE_MODE=stable SHARE_AUTH_USER=$user SHARE_AUTH_PASSWORD=$password
-    [ "$temp" -eq 1 ] && SHARE_MODE=temp
-    share_stable "$domain" "$host" "$user" "$password"
+    mkdir -p "$SHARE_RUN_DIR" && echo $$ > "$SHARE_RUN_DIR/$domain"
+    {
+        # Without a domain of your own, every share is an anonymous one.
+        if [ "$anonymous" -eq 1 ] || ! share_ready; then
+            if [ -n "$name" ] || [ "$auth" -eq 1 ]; then
+                fail share_domain_required "--name and --auth need your own domain: $SCRIPT_NAME share setup <domain>"
+                return 1
+            fi
+            SHARE_MODE=anonymous SHARE_AUTH_USER="" SHARE_AUTH_PASSWORD=""
+            share_quick "$domain"
+            return
+        fi
+
+        local dir="$SHARE_DIR/sites/$domain" host
+        share_prepare "$domain" "$name" "$temp" || return 1
+        if [ "$temp" -eq 1 ]; then
+            host="$(share_random_name).$(share_domain)"
+        else
+            host=$(share_host "$domain")
+        fi
+        # Open unless this share asks for a password. Nothing is kept: a generated
+        # password is new every share, and the password file goes when it stops.
+        if [ "$auth" -eq 1 ]; then
+            [ -z "$password" ] && password=$(make_share_password)
+            write_share_htpasswd "$domain" "$user" "$password" || return 1
+        else
+            user="" password=""
+            rm -f "$SHARE_CONF_DIR/$domain.htpasswd"
+        fi
+        write_tunnel_config "$domain" "$host"
+        apply_share_conf "$domain" "$host" || return 1
+        SHARE_MODE=stable SHARE_AUTH_USER=$user SHARE_AUTH_PASSWORD=$password
+        [ "$temp" -eq 1 ] && SHARE_MODE=temp
+        share_stable "$domain" "$host" "$user" "$password"
+    } always {
+        rm -f "$SHARE_RUN_DIR/$domain"
+    }
 }
 
 function share_domain() {
@@ -256,6 +265,14 @@ function share_domain() {
 }
 
 # True once 'patchy share setup' has connected a domain.
+# A running share's file in $SHARE_RUN_DIR: patchy's pid, then once the link
+# works, its URL, mode and whether it needs a password (auth or open).
+# 'share_running <site>' succeeds while that share's patchy is alive.
+function share_running() {
+    local file="$SHARE_RUN_DIR/$1"
+    [ -f "$file" ] && kill -0 "$(head -n1 "$file")" 2>/dev/null
+}
+
 function share_ready() {
     [ -s "$SHARE_DIR/cert.pem" ] && [ -s "$SHARE_DIR/domain" ]
 }
@@ -642,7 +659,6 @@ function share_stable() {
         notice="Anyone with the address can see the site (add --auth to require a password).\nPress Ctrl-C to stop sharing..."
     fi
 
-    echo $$ > "$dir/pid"
     trap 'stopping=1' INT TERM HUP
     share_sweep "$domain"
     if ! share_route "$domain" "$host"; then
@@ -670,7 +686,7 @@ function share_stable() {
     # A second Ctrl-C must not cut the cleanup short.
     trap '' INT TERM HUP
     share_sweep "$domain"
-    rm -f "$SHARE_CONF_DIR/$domain.htpasswd" "$dir/pid"
+    rm -f "$SHARE_CONF_DIR/$domain.htpasswd"
     trap - INT TERM HUP
     return $result
 }

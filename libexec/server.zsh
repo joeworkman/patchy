@@ -7,7 +7,8 @@ function start_server() {
     sync_hosts_entries
     legacy_dns_hint
     if ! wait_for_apache; then
-        fail apache_start_failed "Warning: Apache did not start." "$(diagnose_startup_failure)"
+        diagnose_startup_failure
+        fail "$STARTUP_ERROR" "Warning: Apache did not start." "$STARTUP_DETAILS"
         return 1
     fi
 }
@@ -28,7 +29,17 @@ function wait_for_apache() {
 # only ever go to stderr — so this whole class of failure leaves no trace
 # in 'patchy errors'. Re-run httpd attached to a pipe to surface the real
 # error; if it comes up fine that way, the launchd job itself is wedged.
+# Sets STARTUP_ERROR (apache_start_failed, port_in_use or service_stuck) and
+# STARTUP_DETAILS, the explanation for people.
 function diagnose_startup_failure() {
+    local details code
+    details=$(diagnose_startup_details)
+    code=$(sed -n 's/^@//p' <<<"$details" | tail -n1)
+    STARTUP_ERROR=${code:-apache_start_failed}
+    STARTUP_DETAILS=$(grep -v '^@' <<<"$details")
+}
+
+function diagnose_startup_details() {
     local httpd_bin="$BREW_PREFIX/opt/httpd/bin/httpd"
     local out pid i
     if [ ! -x "$httpd_bin" ] || ! out=$(mktemp); then
@@ -47,6 +58,7 @@ function diagnose_startup_failure() {
         # A stop boots the job out; the next start reloads it clean.
         kill "$pid" 2>/dev/null
         wait "$pid" 2>/dev/null
+        echo "@service_stuck"
         echo "Apache starts fine when run directly — the launchd service is stuck."
         echo "Run '$SCRIPT_NAME stop' and then '$SCRIPT_NAME start' to reset it."
     elif [ -s "$out" ]; then
@@ -54,6 +66,7 @@ function diagnose_startup_failure() {
         echo "Apache's startup error:"
         sed 's/^/  /' "$out"
         if grep -q "Address already in use" "$out"; then
+            echo "@port_in_use"
             # One line per listening process name — prefork spawns dozens of
             # identical workers and listing them all buries the answer.
             local holders
@@ -102,7 +115,8 @@ function restart_server() {
     brew services restart httpd
     sync_hosts_entries
     wait_for_apache && return 0
-    fail apache_start_failed "Warning: Apache did not come back up after restart." "$(diagnose_startup_failure)"
+    diagnose_startup_failure
+    fail "$STARTUP_ERROR" "Warning: Apache did not come back up after restart." "$STARTUP_DETAILS"
     return 1
 }
 
@@ -141,13 +155,13 @@ function tail_logs() {
 function errors_json() {
     local arg=$1 log="$LOG_DIR/error_log"
     if [[ $arg != <1-> ]]; then
-        jq -nc --arg arg "$arg" '{ok: false, error: "invalid_argument",
+        json_doc -c --arg arg "$arg" '{ok: false, error: "invalid_argument",
             message: "errors --json takes a number of lines, not \($arg)", details: null, warnings: []}'
         return 1
     fi
     local lines="[]"
     [ -f "$log" ] && lines=$(tail -n "$arg" "$log" | jq -R . | jq -sc .)
-    jq -n --arg log "$log" --argjson lines "$lines" '{log: $log, lines: $lines}'
+    json_doc --arg log "$log" --argjson lines "$lines" '{log: $log, lines: $lines}'
 }
 
 function errors() {
@@ -232,7 +246,7 @@ function server_info() {
 function info_json() {
     local apache
     apache=$(apachectl -V 2>/dev/null)
-    jq -n --arg apache "$(print -r -- "$apache" | sed -n 's|^Server version: *Apache/\([^ ]*\).*|\1|p')" \
+    json_doc --arg apache "$(print -r -- "$apache" | sed -n 's|^Server version: *Apache/\([^ ]*\).*|\1|p')" \
         --arg mpm "$(print -r -- "$apache" | sed -n 's/^Server MPM: *//p')" \
         --arg built "$(print -r -- "$apache" | sed -n 's/^Server built: *//p')" \
         --arg php "$(php -r 'echo PHP_VERSION;' 2>/dev/null)" \
@@ -244,8 +258,9 @@ function info_json() {
         }'
 }
 
-# 'patchy status --json': Apache, /etc/hosts routing, the trust helper and the
-# sharing domain. trust is enabled, outdated or off.
+# 'patchy status --json': Apache, PHP, /etc/hosts routing, the trust helper,
+# mkcert's certificate authority, sharing and the main paths. trust is
+# enabled, outdated or off.
 function server_status_json() {
     local running=false trust=off d domains=($(list_hosts_names)) missing=()
     is_apache_running && running=true
@@ -257,12 +272,27 @@ function server_status_json() {
     elif trust_installed; then
         trust=outdated
     fi
-    jq -n --argjson running "$running" --argjson names "${#domains[@]}" \
+    local ca_exists=false ca_trusted=false cloudflared=false
+    root_cert_exists 2>/dev/null && ca_exists=true
+    [ "$ca_exists" = true ] && ca_trusted && ca_trusted=true
+    command -v cloudflared >/dev/null 2>&1 && cloudflared=true
+    json_doc --argjson running "$running" --argjson names "${#domains[@]}" \
         --argjson missing "$(print -rl -- "${missing[@]}" | jq -R 'select(. != "")' | jq -sc .)" \
-        --arg trust "$trust" --arg share_domain "$(share_ready && share_domain)" '{
+        --arg trust "$trust" --arg share_domain "$(share_ready && share_domain)" \
+        --arg php_active "$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null)" \
+        --argjson php_installed "$(php_installed_json)" \
+        --argjson ca_exists "$ca_exists" --argjson ca_trusted "$ca_trusted" \
+        --argjson cloudflared "$cloudflared" \
+        --arg error_log "$LOG_DIR/error_log" --arg httpd_conf "$APACHE_CONFIG" \
+        --arg php_ini "$(php -r 'echo php_ini_loaded_file() ?: "";' 2>/dev/null)" '
+        def nul: if . == "" then null else . end;
+        {
             apache: {running: $running},
+            php: {active: ($php_active | nul), installed: $php_installed},
             hosts: {names: $names, routed: ($names - ($missing | length)), missing: $missing},
             trust: $trust,
-            share_domain: (if $share_domain == "" then null else $share_domain end)
+            certificate_authority: {exists: $ca_exists, trusted: $ca_trusted},
+            share: {domain: ($share_domain | nul), cloudflared: $cloudflared},
+            paths: {error_log: $error_log, httpd_conf: $httpd_conf, php_ini: ($php_ini | nul)}
         }'
 }

@@ -6,6 +6,20 @@ function php_info() {
     php -v
 }
 
+# Installed Homebrew PHPs as JSON, newest first: [{"version": "8.4",
+# "full": "8.4.11", "formula": "php"}, ...].
+function php_installed_json() {
+    local formulas=($(brew list --formula 2>/dev/null | grep -E '^php(@[0-9.]+)?$'))
+    if [ ${#formulas[@]} -eq 0 ]; then
+        echo "[]"
+        return 0
+    fi
+    brew list --versions "${formulas[@]}" 2>/dev/null | jq -R '
+        split(" ") | {formula: .[0], full: (.[-1] | sub("_[0-9]+$"; ""))}
+        | .version = (.full | split(".")[0:2] | join("."))' |
+        jq -sc 'sort_by(.version | split(".") | map(tonumber? // 0)) | reverse'
+}
+
 # Resolve the Homebrew formula for a PHP version: "php" for the latest, "php@X.Y" otherwise
 function php_formula_for_version() {
     local version=$1
