@@ -17,10 +17,12 @@ function fail() {
     return 0
 }
 
-# Record a problem that doesn't stop the command, for --json's warnings. The
-# caller prints its own message for people.
+# Record a problem that doesn't stop the command, for --json's warnings, with
+# the site it's about when there is one. The caller prints its own message for
+# people.
 function warn() {
-    PATCHY_WARNINGS+=("$(jq -nc --arg code "$1" --arg message "$2" '{code: $code, message: $message}')")
+    PATCHY_WARNINGS+=("$(jq -nc --arg code "$1" --arg message "$2" --arg site "${3:-}" \
+        '{code: $code, message: $message} + (if $site == "" then {} else {site: $site} end)')")
 }
 
 # Under --json, write one JSON line (from jq -n arguments) to fd 3, the real

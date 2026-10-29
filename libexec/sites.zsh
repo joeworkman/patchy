@@ -249,7 +249,7 @@ function list_sites() {
         echo "No sites configured."
         return 0
     fi
-    local domain docroot https state days needs_attention=0
+    local domain docroot https state days needs_attention=0 missing_docroot=0
     local orange="" red="" reset=""
     if [ -t 1 ]; then
         orange=$'\e[38;5;208m'
@@ -264,6 +264,11 @@ function list_sites() {
     printf "%-${dwidth}s %-8s %s\n" "DOMAIN" "HTTPS" "DOCROOT"
     while IFS= read -r domain; do
         docroot=$(site_docroot "$domain")
+        local docroot_note=""
+        if [ ! -d "$docroot" ]; then
+            docroot_note=" ${red}(missing)${reset}"
+            missing_docroot=1
+        fi
         docroot="${docroot/#$HOME/~}"
         local color=""
         read -r state days <<<"$(site_cert_state "$domain")"
@@ -275,7 +280,7 @@ function list_sites() {
             *) https="${days}d" ;;
         esac
         # color applied outside the padding so escape codes don't skew column width
-        printf "%-${dwidth}s ${color}%-8s${reset} %s\n" "$domain" "$https" "$docroot"
+        printf "%-${dwidth}s ${color}%-8s${reset} %s%s\n" "$domain" "$https" "$docroot" "$docroot_note"
     done < <(list_domains)
     if share_ready; then
         local share first=1
@@ -291,6 +296,10 @@ function list_sites() {
     if [ "$needs_attention" -eq 1 ]; then
         echo ""
         echo "Some certificates expire soon or are invalid. Run 'patchy refresh-certs' to regenerate them."
+    fi
+    if [ "$missing_docroot" -eq 1 ]; then
+        echo ""
+        echo "Some sites' folders are missing. Create the folder again, or remove the site with '$SCRIPT_NAME rm <domain>'."
     fi
 }
 
@@ -347,21 +356,25 @@ function remove_domain() {
     rm -f "$VHOSTS_DIR/$domain.conf"
 }
 
-# 'patchy list --json': {"sites": [...]}, one object per site with its folder,
-# aliases, certificate and, once shared on your own domain, its stable address.
+# 'patchy list --json': {"sites": [...]}, one object per site with its folder
+# (and whether it exists), aliases, certificate and, once shared on your own
+# domain, its stable address.
 function list_sites_json() {
-    local domain state days address
+    local domain docroot state days address
     list_domains | while IFS= read -r domain; do
+        docroot=$(site_docroot "$domain")
         read -r state days <<<"$(site_cert_state "$domain")"
         address=""
         if share_ready && [ -f "$SHARE_DIR/sites/$domain/name" ]; then
             address="https://$(share_host "$domain")"
         fi
-        jq -nc --arg domain "$domain" --arg docroot "$(site_docroot "$domain")" \
+        jq -nc --arg domain "$domain" --arg docroot "$docroot" \
+            --argjson docroot_exists "$([ -d "$docroot" ] && echo true || echo false)" \
             --argjson aliases "$(list_site_aliases "$domain" | jq -R . | jq -sc .)" \
             --arg state "$state" --arg days "$days" --arg address "$address" '{
                 domain: $domain,
                 docroot: $docroot,
+                docroot_exists: $docroot_exists,
                 aliases: $aliases,
                 certificate: {state: $state, days_left: ($days | if . == "" then null else tonumber end)},
                 share_address: (if $address == "" then null else $address end)

@@ -380,6 +380,7 @@ function share_forget_site() {
     [ -f "$dir/tunnel" ] || return 0
     share_sweep "$domain"
     if ! cf_tunnel delete -f "$(<"$dir/tunnel")" >/dev/null 2>&1; then
+        warn tunnel_delete_failed "Couldn't delete the tunnel $(<"$dir/tunnel") on Cloudflare." "$domain"
         echo "Couldn't delete the tunnel $(<"$dir/tunnel") on Cloudflare. Delete it in the Cloudflare dashboard (Networks › Tunnels)."
     fi
     rm -rf "$dir"

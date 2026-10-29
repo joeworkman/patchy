@@ -219,7 +219,8 @@ patchy version --json
 #   "share_anonymous", "share_name", "share_auth"]}
 ```
 
-`list` and `status` print one JSON document:
+`list`, `status` and `info` print one JSON document, and `errors [lines]`
+prints the last lines of Apache's error log (`errors -f` has no JSON form):
 
 ```bash
 patchy status --json
@@ -228,17 +229,25 @@ patchy status --json
 
 patchy list --json
 # {"sites": [{"domain": "harbor.test", "docroot": "/Users/you/Websites/harbor",
-#   "aliases": [], "certificate": {"state": "ok", "days_left": 753},
+#   "docroot_exists": true, "aliases": [], "certificate": {"state": "ok", "days_left": 753},
 #   "share_address": "https://harbor.example.com"}]}
+
+patchy info --json
+# {"apache": {"version": "2.4.69", "mpm": "prefork", "built": "Sep 29 2026 12:44:27"},
+#  "php": {"version": "8.2.35", "ini": "/opt/homebrew/etc/php/8.2/php.ini"}}
+
+patchy errors 50 --json
+# {"log": "/opt/homebrew/var/log/httpd/error_log", "lines": ["[Thu Oct 29 ...] ..."]}
 ```
 
-`trust` is `enabled`, `outdated` or `off`. A certificate's `state` is `ok`,
+`trust` is `enabled`, `outdated` or `off`. `docroot_exists` is `false` when
+a site's folder has been moved or deleted. A certificate's `state` is `ok`,
 `expiring` (30 days or fewer), `expired`, `invalid` or `none`.
 `share_address` is a site's stable address once it has been shared on your
 own domain, and `null` otherwise.
 
-`add`, `rm`, `start`, `stop`, `restart`, `php`, `refresh-certs`, `trust` and
-`untrust` print only one result line:
+`add`, `rm`, `start`, `stop`, `restart`, `check`, `php`, `refresh-certs`,
+`trust`, `untrust` and `share reset` print only one result line:
 
 ```bash
 patchy add harbor.test --json
@@ -246,12 +255,18 @@ patchy add harbor.test --json
 
 patchy add harbor.com --json
 # {"ok":false,"error":"confirmation_required","message":"harbor.com looks like a real domain, ...","details":null,"warnings":[]}
+
+patchy check --json
+# {"ok":true,"warnings":[{"code":"docroot_missing","message":"export.test's folder /Users/you/Desktop/export is missing","site":"export.test"}]}
 ```
 
 `error` is a code that stays the same between releases; `message` is for
 people and can change. `details` holds extra lines, such as Apache's startup
 error, or is `null`. `warnings` lists problems that didn't stop the command,
-each with a `code` and `message`.
+each with a `code`, a `message` and, when it's about one site, the `site`.
+The warning codes are `hosts_update_failed` and `sudo_required` (`/etc/hosts`
+wasn't updated), `docroot_missing` (from `check`) and `tunnel_delete_failed`
+(from `share reset` and `rm`, when Cloudflare kept a tunnel).
 
 With `--json` patchy never asks questions:
 
