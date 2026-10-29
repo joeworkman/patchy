@@ -1,0 +1,16 @@
+#!/bin/zsh
+# Test stand-in for patchy: prints a canned JSON fixture for each command and
+# logs every call. A fixture set only holds what differs from default/.
+emulate -L zsh
+case "$1" in
+    version|list|status) name=$1.json ;;
+    *) name=result.json ;;
+esac
+print -r -- "$*" >> "${STUB_LOG:-/dev/null}"
+for dir in "$STUB_DIR" "$STUB_DIR/../default"; do
+    if [ -f "$dir/$name" ]; then
+        cat "$dir/$name"
+        exit 0
+    fi
+done
+exit 1

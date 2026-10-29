@@ -200,6 +200,7 @@ and anonymous links keep working.
 | `patchy untrust` | Remove the passwordless helper; `/etc/hosts` updates prompt for a password again. |
 | `patchy help` | Print all of the above. |
 | `patchy docs` | Print this documentation, matching the installed version. |
+| `patchy alfred` | Install the [Alfred workflow](#alfred), matching the installed version. |
 
 ### Editor
 
@@ -212,6 +213,28 @@ export EDITOR=vim # or nvim, subl, cursor, etc.
 # or, to wait for the editor to close before returning:
 export VISUAL="code -w"
 ```
+
+### Alfred
+
+The Patchy workflow for [Alfred](https://www.alfredapp.com) opens your sites,
+starts and stops Apache, and switches PHP without a terminal. It needs
+Alfred 5 with the Powerpack.
+
+- **Install:** run `patchy alfred`, and Alfred asks to install the workflow.
+  Run it again after upgrading Patchy to update the workflow. Or download
+  `Patchy.alfredworkflow` from the
+  [latest release](https://github.com/joeworkman/patchy/releases/latest).
+- **Open a site:** type `patchy` and pick a site, or keep typing to filter.
+  Enter opens it in your browser.
+- **Start, stop or restart Apache:** the top of the same list shows whether
+  Apache is running and what you can do.
+- **Switch PHP:** type `patchy php` and pick a version.
+
+The result shows as a notification. When Patchy needs your password to update
+`/etc/hosts`, a dialog asks for it; run `patchy trust` once to stop that. To
+change the keyword, or to point the workflow at a patchy outside
+`/opt/homebrew/bin` and `/usr/local/bin`, open the workflow's configuration
+in Alfred.
 
 ### Scripts and AI agents
 

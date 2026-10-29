@@ -77,6 +77,28 @@ function show_docs() {
     return 1
 }
 
+# 'patchy alfred': package the Alfred workflow that ships with this version
+# and open it, so Alfred offers to install or update it. brew installs the
+# workflow under share/patchy; a clone has it at the top.
+function install_alfred_workflow() {
+    local src out
+    for src in "${SCRIPT_PATH:h:h}/share/patchy/alfred" "${SCRIPT_PATH:h:h}/alfred"; do
+        [ -f "$src/build.zsh" ] && break
+        src=""
+    done
+    if [ -z "$src" ]; then
+        echo "The Alfred workflow isn't installed. Download it from https://github.com/joeworkman/patchy/releases"
+        return 1
+    fi
+    if ! open -Ra "Alfred 5" 2>/dev/null; then
+        echo "Alfred isn't installed. Get it at https://www.alfredapp.com (the workflow needs the Powerpack)."
+        return 1
+    fi
+    out=$(zsh "$src/build.zsh" "$(patchy_version)" "${TMPDIR:-/tmp}/Patchy.alfredworkflow") || return 1
+    open "$out"
+    echo "Alfred will ask to install the Patchy workflow."
+}
+
 # Function to display help message
 function show_help() {
     cat <<EOF
@@ -88,6 +110,7 @@ Usage: $SCRIPT_NAME {command} [options]
 Commands:
   help                  Show this help message
   docs                  Print the full documentation (for people and AI agents)
+  alfred                Install the Alfred workflow (needs Alfred's Powerpack)
 
   list                  List the sites configured on the Apache server
   add <domain> [dir]    Add a new site (docroot defaults to ~/Websites/<domain>)
@@ -176,6 +199,9 @@ case "${1:-}" in
         ;;
     docs)
         show_docs
+        ;;
+    alfred)
+        install_alfred_workflow
         ;;
     start)
         json_result start_server
@@ -270,7 +296,8 @@ case "${1:-}" in
             json_doc --arg version "$(patchy_version)" '{
                 version: $version,
                 features: ["json", "add_yes", "add_www", "folder", "askpass",
-                    "share", "share_temp", "share_anonymous", "share_name", "share_auth"]
+                    "share", "share_temp", "share_anonymous", "share_name", "share_auth",
+                    "alfred"]
             }'
         else
             echo "patchy $(patchy_version)"

@@ -1,0 +1,42 @@
+name: Attach Alfred workflow
+
+# When a release is published, package the Alfred workflow for that tag and
+# attach it to the release as Patchy.alfredworkflow.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach to (e.g. v1.4.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  attach:
+    runs-on: macos-latest
+    steps:
+      - name: Resolve release tag
+        id: rel
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: echo "tag=${EVENT_TAG:-$INPUT_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.rel.outputs.tag }}
+
+      - name: Package the workflow
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: zsh alfred/build.zsh "${TAG#v}" Patchy.alfredworkflow
+
+      - name: Attach it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: gh release upload "$TAG" Patchy.alfredworkflow --clobber
