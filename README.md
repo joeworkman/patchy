@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo/patchy-mark-dark.svg">
+  <img src="assets/logo/patchy-mark.svg" alt="Patchy logo: a feather sewn from fabric patches" width="160">
+</picture>
+
 # Patchy
 
 A patchy little PHP dev server for macOS (running Apache).
