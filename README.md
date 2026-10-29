@@ -28,6 +28,8 @@ Patchy is that environment: **Apache 2 + mod_php**, local HTTPS, friendly `.test
 brew install joeworkman/patchy/patchy
 ```
 
+**Prefer an app?** [Patchy UI](https://github.com/jeso87/Patchy-UI) is a native macOS app for Patchy, made by [@jeso87](https://github.com/jeso87): add sites, switch PHP and share sites without opening Terminal.
+
 That's it — the formula pulls in all dependencies (`httpd`, `php`, `mkcert`, `jq`) and configures Apache (ports 80/443, required modules, PHP handler) to run as your user during install.
 
 ### From source
@@ -395,7 +397,7 @@ a share, send `patchy` SIGINT or SIGTERM; it cleans up before `stopped`.
 | `.htaccess` & mod_rewrite | ✅ native | ✗ (needs conversion) | ✗ (needs conversion) |
 | Local HTTPS | ✅ mkcert | ✅ | ✅ |
 | PHP switching | ✅ | ✅ | ✅ |
-| GUI | — | — | ✅ |
+| GUI | ✅ [Patchy UI](https://github.com/jeso87/Patchy-UI) (community) | — | ✅ |
 | License | MIT | MIT | freemium |
 
 If your stack targets Nginx + FPM, Valet or Herd will probably serve you better. If your stack targets Apache — or you just prefer Apache — Patchy is for you.
