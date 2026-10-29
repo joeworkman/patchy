@@ -344,6 +344,7 @@ a share, send `patchy` SIGINT or SIGTERM; it cleans up before `stopped`.
 | `config_invalid` | Apache rejected the configuration |
 | `cert_failed`, `certificate_missing` | A certificate couldn't be made, or the site has none |
 | `php_not_installed`, `php_link_failed` | Switching PHP failed |
+| `php_module_missing` | Apache is set up for a PHP that's no longer installed; `details` says which `patchy php` to run |
 | `trust_failed`, `unsafe_path`, `terminal_required` | `trust` or `untrust` failed |
 | `cloudflared_missing`, `cloudflare_error`, `cloudflare_login_expired` | cloudflared or Cloudflare failed |
 | `share_domain_required`, `invalid_name`, `name_taken` | `--name`/`--auth` need your own domain, or the name can't be used |
