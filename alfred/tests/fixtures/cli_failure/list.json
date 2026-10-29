@@ -1,0 +1,5 @@
+{
+  "ok": false,
+  "error": "setup_required",
+  "message": "Run patchy setup first."
+}

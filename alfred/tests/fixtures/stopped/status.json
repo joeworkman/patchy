@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "apache": {
+    "running": false
+  },
+  "php": {
+    "active": "8.5",
+    "installed": [
+      {
+        "formula": "php",
+        "full": "8.5.12",
+        "version": "8.5"
+      },
+      {
+        "formula": "php@8.4",
+        "full": "8.4.27",
+        "version": "8.4"
+      }
+    ]
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "sites": [
+    {
+      "domain": "alpha.test",
+      "docroot": "/Users/me/Sites/alpha",
+      "docroot_exists": true,
+      "aliases": [],
+      "certificate": {
+        "state": "ok",
+        "days_left": 800,
+        "expires": "2029-01-01T00:00:00Z"
+      },
+      "routed": true,
+      "logs": {
+        "error": null,
+        "access": null
+      },
+      "share": {
+        "address": null,
+        "running": null
+      }
+    },
+    {
+      "domain": "beta.test",
+      "docroot": "/Users/me/Sites/beta",
+      "docroot_exists": false,
+      "aliases": [],
+      "certificate": {
+        "state": "expired",
+        "days_left": -3,
+        "expires": "2026-10-26T00:00:00Z"
+      },
+      "routed": true,
+      "logs": {
+        "error": null,
+        "access": null
+      },
+      "share": {
+        "address": null,
+        "running": null
+      }
+    }
+  ]
+}
