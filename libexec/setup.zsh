@@ -60,6 +60,17 @@ function disable_main_conf_php() {
     fi
 }
 
+# True once 'patchy setup' has wired patchy.conf into httpd.conf ahead of the
+# sites. Without it, mod_rewrite and mod_ssl may never load, and every site
+# config fails Apache's check (RewriteEngine is an "Invalid command").
+function patchy_configured() {
+    [ -f "$PATCHY_CONF" ] || return 1
+    local inc_no sites_no
+    inc_no=$(active_line_no "Include $PATCHY_CONF" "$APACHE_CONFIG")
+    sites_no=$(active_line_no "IncludeOptional $VHOSTS_DIR/*.conf" "$APACHE_CONFIG")
+    [ -n "$inc_no" ] && { [ -z "$sites_no" ] || [ "$inc_no" -lt "$sites_no" ]; }
+}
+
 # Ensure httpd.conf includes patchy.conf BEFORE the per-site vhosts: Apache
 # parses sequentially, and vhost directives like RewriteEngine error at parse
 # time if their module loads later.

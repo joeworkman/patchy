@@ -59,6 +59,11 @@ function add_site() {
     fi
     [ -z "$docroot" ] && docroot="$DEFAULT_WEBROOT/$domain"
 
+    if ! patchy_configured; then
+        fail setup_required "Patchy isn't set up yet. Run patchy setup first, then add the site again."
+        return 1
+    fi
+
     if site_exists "$domain"; then
         fail site_exists "Site already exists... $domain"
         return 1

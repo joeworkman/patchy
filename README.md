@@ -386,6 +386,7 @@ a share, send `patchy` SIGINT or SIGTERM; it cleans up before `stopped`.
 | Code | Meaning |
 |---|---|
 | `missing_argument`, `invalid_argument`, `unknown_option`, `conflicting_options` | The command line is wrong |
+| `setup_required` | `add` needs `patchy setup` to have run first |
 | `site_exists`, `site_not_found` | The site is already set up, or isn't |
 | `folder_not_found` | `folder` was given a folder that doesn't exist |
 | `confirmation_required` | `add` needs `--yes` for a real domain |
