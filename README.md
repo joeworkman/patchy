@@ -214,6 +214,24 @@ export EDITOR=vim # or nvim, subl, cursor, etc.
 export VISUAL="code -w"
 ```
 
+### Tab completion
+
+In zsh, press Tab to complete Patchy's commands, your sites (`patchy rm`,
+`share`, `folder`, `errors`), the installed PHP versions (`patchy php`) and
+each command's options.
+
+Homebrew installs the completion. If Tab doesn't complete Patchy yet, your
+`~/.zshrc` needs Homebrew's completions on `fpath` before `compinit` runs
+(Oh My Zsh and most setups already do this):
+
+```bash
+FPATH="$(brew --prefix)/share/zsh/site-functions:$FPATH"
+autoload -Uz compinit && compinit
+```
+
+From source, add the clone's `completions` folder instead:
+`fpath=(~/path/to/patchy/completions $fpath)`. Then open a new terminal.
+
 ### Alfred
 
 The Patchy workflow for [Alfred](https://www.alfredapp.com) opens your sites,

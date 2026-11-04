@@ -1,0 +1,125 @@
+#compdef patchy
+# zsh completion for patchy: its commands, the sites it serves, the installed
+# PHP versions, and each command's options. Homebrew installs this into
+# share/zsh/site-functions.
+#
+# Sites and PHP versions are read straight from disk rather than by running
+# patchy, which takes a second or more: Tab has to answer at once.
+
+# Homebrew's prefix without running brew, which is slow too.
+_patchy_prefix() {
+    local p
+    for p in ${HOMEBREW_PREFIX:-} /opt/homebrew /usr/local; do
+        [[ -n $p && -d $p/etc/httpd ]] && { print -r -- $p; return }
+    done
+}
+
+# One per site: <prefix>/etc/httpd/sites/<domain>.conf
+_patchy_sites() {
+    local prefix=$(_patchy_prefix)
+    local -a sites
+    sites=( $prefix/etc/httpd/sites/*.conf(N:t:r) )
+    _describe -t sites 'site' sites
+}
+
+# The X.Y of each installed php@X.Y (the plain "php" formula has one too).
+_patchy_php_versions() {
+    local prefix=$(_patchy_prefix)
+    local -a versions
+    versions=( $prefix/opt/php@<->.<->(N:t) )
+    versions=( ${(u)versions#php@} )
+    _describe -t versions 'PHP version' versions
+}
+
+_patchy() {
+    local -a commands
+    commands=(
+        'help:Show the help message'
+        'docs:Print the full documentation'
+        'alfred:Install the Alfred workflow'
+        'list:List the sites'
+        'add:Add a new site'
+        'folder:Serve a site from another folder'
+        'rm:Remove one or more sites'
+        'status:Show the status of Apache and /etc/hosts routing'
+        'start:Start Apache and route site domains to this Mac'
+        'stop:Stop Apache and release site domains'
+        'restart:Restart Apache and repair /etc/hosts routing'
+        'share:Share a site at a public link'
+        'config:Edit the Apache configuration file'
+        'ini:Edit the PHP configuration file'
+        'check:Verify the Apache and PHP configuration'
+        'info:Show Apache and PHP version information'
+        'version:Show the Patchy version'
+        'php:Switch PHP version'
+        'pecl:Install common PECL extensions'
+        'refresh-certs:Refresh the SSL certificates'
+        'setup:One-time setup'
+        'trust:Update /etc/hosts without a sudo password'
+        'untrust:Remove the passwordless /etc/hosts helper'
+        'errors:Show the Apache error log, or a site'\''s'
+        'logs:Tail the Apache logs'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'patchy command' commands
+        return
+    fi
+
+    local json='--json[machine-readable output]'
+    case $words[2] in
+        add)
+            _arguments -s \
+                '2:domain:' \
+                '3:document root:_directories' \
+                '--yes[skip the question asked before routing a real domain]' \
+                '(--no-www)--www[also serve www.<domain>]' \
+                '(--www)--no-www[don'\''t serve www.<domain>]' \
+                $json
+            ;;
+        folder)
+            _arguments '2:site:_patchy_sites' '3:folder:_directories' $json
+            ;;
+        rm)
+            _arguments '*:site:_patchy_sites' $json
+            ;;
+        share)
+            if (( CURRENT == 3 )) && [[ $PREFIX != -* ]]; then
+                local -a subcommands
+                subcommands=(
+                    'setup:Use your own Cloudflare domain'
+                    'reset:Stop using your own domain'
+                )
+                _describe -t subcommands 'share command' subcommands
+                _patchy_sites
+            elif (( CURRENT > 3 )) && [[ $words[3] == setup ]]; then
+                _message 'your Cloudflare domain'
+            elif (( CURRENT == 3 )) || [[ $words[3] != reset ]]; then
+                _arguments \
+                    '(--anonymous --name)--temp[a random address on your domain]' \
+                    '(--temp --name)--anonymous[an anonymous trycloudflare.com link]' \
+                    '(--temp --anonymous)--name[use <word>.<your domain>]:word:' \
+                    '--auth[require a password (optionally user:pass)]::user\:pass:' \
+                    $json \
+                    '*:site:_patchy_sites'
+            fi
+            ;;
+        errors)
+            if (( CURRENT == 3 )); then
+                _alternative \
+                    'sites:site:_patchy_sites' \
+                    'follow:option:((-f\:"follow the log"))'
+            else
+                _alternative 'follow:option:((-f\:"follow the log"))'
+            fi
+            ;;
+        php)
+            _arguments '2:PHP version:_patchy_php_versions' $json
+            ;;
+        list|status|version|info|check|start|stop|restart|refresh-certs|trust|untrust)
+            _arguments '1: :' $json
+            ;;
+    esac
+}
+
+_patchy "$@"
