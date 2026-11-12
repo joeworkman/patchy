@@ -191,7 +191,6 @@ function detect_php_line() {
         echo "$line"
         return 0
     fi
-    local version
     version=$(php -n -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null)
     if [ -n "$version" ]; then
         php_module_line "$version" "$(php_formula_for_version "$version")"
